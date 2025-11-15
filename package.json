@@ -28,7 +28,14 @@
       "icon": "mandarinPDF3.ico"
     },
     "publish": null,
-    "mac": null
+    "mac": null,
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF Document",
+        "role": "Viewer"
+      }
+    ]
   },
   "dependencies": {
     "pdfjs-dist": "^3.8.162",
