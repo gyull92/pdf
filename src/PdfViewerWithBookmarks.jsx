@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef } from "react";
 import styled from "styled-components";
 import * as pdfjsLib from "pdfjs-dist";
 import "pdfjs-dist/web/pdf_viewer.css";
@@ -19,14 +19,57 @@ const Sidebar = styled.div`
   border-right: 1px solid #ccc;
   padding: 10px;
   overflow-y: auto;
+  flex-shrink: 0;
 `;
 
+// 왼쪽 접힘 탭
+const LeftCollapsedTab = styled.div`
+  width: 24px;
+  background: #f0f0f0;
+  border-right: 1px solid #ccc;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+  user-select: none;
+
+  &:hover {
+    background: #e4e4e4;
+  }
+`;
+
+// 오른쪽 접힘 탭
+const RightCollapsedTab = styled.div`
+  width: 24px;
+  background: #f0f0f0;
+  border-left: 1px solid #ccc;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+  user-select: none;
+
+  &:hover {
+    background: #e4e4e4;
+  }
+`;
+
+// 형광펜 / 지우개 모드일 때 커서 변경
 const Main = styled.div`
   flex: 1;
   display: flex;
   flex-direction: column;
   overflow: auto;
   position: relative;
+  cursor: ${(props) => (props.$highlight ? "crosshair" : "default")};
 `;
 
 const PagesWrapper = styled.div`
@@ -34,6 +77,12 @@ const PagesWrapper = styled.div`
   flex-direction: column;
   align-items: center;
   padding-bottom: 40px;
+`;
+
+// 각 페이지 컨테이너 (캔버스 + 텍스트 레이어)
+const PageContainer = styled.div`
+  position: relative;
+  margin-bottom: 20px;
 `;
 
 const Toolbar = styled.div`
@@ -84,7 +133,7 @@ const ZoomValue = styled.span`
 // PDF 캔버스
 const Canvas = styled.canvas`
   box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
-  margin-bottom: 20px;
+  cursor: ${(props) => (props.$highlight ? "crosshair" : "default")};
 `;
 
 // 썸네일
@@ -122,52 +171,20 @@ const ThumbnailIcon = styled.img`
   display: block;
 `;
 
-// 우측 사이드바
+// 우측 사이드바 (리사이즈 가능)
 const RightSidebar = styled.div`
-  width: 280px;
+  width: ${(props) => props.$width}px;
   border-left: 1px solid #ccc;
   padding: 10px;
   overflow-y: auto;
+  flex-shrink: 0;
 `;
 
-const FileGroup = styled.div`
-  margin-bottom: 16px;
+const EmptyText = styled.p`
+  color: #999;
+  font-size: 12px;
 `;
 
-// 문서 제목 + 폴더 버튼 한 줄
-const FileHeaderRow = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-`;
-
-const FileTitle = styled.div`
-  font-weight: bold;
-  cursor: pointer;
-  user-select: none;
-`;
-
-const AddFolderButton = styled.button`
-  font-size: 11px;
-  border: 1px solid #ccc;
-  background: #f8f8f8;
-  border-radius: 4px;
-  padding: 2px 6px;
-  cursor: pointer;
-
-  &:hover {
-    background: #eee;
-  }
-`;
-
-const BookmarkList = styled.ul`
-  list-style: none;
-  padding: 5px 0 0 10px;
-  margin: 0;
-`;
-
-// 북마크 아이템
 const BookmarkItem = styled.li`
   display: flex;
   flex-direction: column;
@@ -177,14 +194,13 @@ const BookmarkItem = styled.li`
   gap: 4px;
 `;
 
-// 1줄: 이름 / 페이지
 const BookmarkHeader = styled.div`
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 8px;
 `;
 
-// 2줄: 수정·삭제 버튼 + 폴더 선택
 const BookmarkMiddleRow = styled.div`
   display: flex;
   align-items: center;
@@ -192,7 +208,6 @@ const BookmarkMiddleRow = styled.div`
   margin-top: 2px;
 `;
 
-// 이름 버튼 (보기 모드)
 const BookmarkLabelButton = styled.button`
   font-size: 15px;
   background: none;
@@ -200,9 +215,9 @@ const BookmarkLabelButton = styled.button`
   color: #007bff;
   cursor: pointer;
   padding: 0;
+  text-align: left;
 `;
 
-// 이름 입력 (수정 모드)
 const BookmarkLabelInput = styled.input`
   font-size: 15px;
   padding: 2px 4px;
@@ -216,53 +231,10 @@ const BookmarkPageText = styled.span`
   flex-shrink: 0;
 `;
 
-// 폴더 선택 드롭다운
-const FolderSelect = styled.select`
-  font-size: 11px;
-  padding: 2px 4px;
-  border-radius: 4px;
-  border: 1px solid #ccc;
-`;
-
-// 수정/삭제 버튼 영역
-const BookmarkActions = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 6px;
-`;
-
 const BookmarkDateRow = styled.div`
   font-size: 10px;
   color: #777;
   margin-left: 2px;
-`;
-
-const RemoveButton = styled.button`
-  font-size: 11px;
-  border: none;
-  background: none;
-  color: red;
-  cursor: pointer;
-`;
-
-const ChangeButton = styled.button`
-  font-size: 11px;
-  border: none;
-  background: none;
-  color: blue;
-  cursor: pointer;
-`;
-
-const CancelButton = styled.button`
-  font-size: 11px;
-  border: none;
-  background: none;
-  color: #555;
-  cursor: pointer;
-`;
-
-const EmptyText = styled.p`
-  color: #999;
 `;
 
 const PageNumberInput = styled.input`
@@ -285,10 +257,9 @@ const FolderTitleRow = styled.div`
   font-size: 12px;
   font-weight: bold;
   color: #555;
-  margin-bottom: 2px;
+  margin-bottom: 4px;
 `;
 
-// 폴더 이름
 const FolderName = styled.span`
   cursor: pointer;
 `;
@@ -305,7 +276,12 @@ const EmptyFolderText = styled.li`
   padding: 2px 0;
 `;
 
-// ✅ 폴더 토글 버튼
+const FolderList = styled.ul`
+  list-style: none;
+  padding-left: 0;
+  margin: 8px 0 16px;
+`;
+
 const FolderToggleButton = styled.button`
   border: none;
   background: none;
@@ -314,17 +290,134 @@ const FolderToggleButton = styled.button`
   padding: 0 2px;
 `;
 
-// ✅ 자동 라벨 / 커스텀 라벨 처리 헬퍼
+const AddFolderButton = styled.button`
+  font-size: 11px;
+  border: 1px solid #ccc;
+  background: #f8f8f8;
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  margin-bottom: 4px;
+
+  &:hover {
+    background: #eee;
+  }
+`;
+
+// 폴더 삭제 버튼 (컨텍스트 메뉴용 텍스트 스타일)
+const DeleteFolderButton = styled.button`
+  font-size: 11px;
+  border: none;
+  background: none;
+  color: #c00;
+  cursor: pointer;
+`;
+
+// 컨텍스트 메뉴
+const ContextMenu = styled.ul`
+  position: fixed;
+  top: ${(props) => props.$y}px;
+  left: ${(props) => props.$x}px;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #ffffff;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  min-width: 140px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  z-index: 9999;
+`;
+
+const ContextMenuItem = styled.li`
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    background: #f0f0f0;
+  }
+`;
+
+// 폴더 선택 모달
+const DialogOverlay = styled.div`
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+`;
+
+const Dialog = styled.div`
+  background: #fff;
+  padding: 16px 20px;
+  border-radius: 8px;
+  min-width: 260px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+`;
+
+const DialogTitle = styled.h4`
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: bold;
+  color: #333;
+`;
+
+const DialogSelect = styled.select`
+  width: 100%;
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  margin-top: 4px;
+`;
+
+const DialogActions = styled.div`
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+`;
+
+const DialogButton = styled.button`
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  background: #f8f8f8;
+  cursor: pointer;
+
+  &:hover {
+    background: #eee;
+  }
+`;
+
+// 오른쪽 리사이즈 핸들
+const RightResizeHandle = styled.div`
+  width: 4px;
+  cursor: col-resize;
+  background: #ddd;
+  flex-shrink: 0;
+  align-self: stretch;
+
+  &:hover {
+    background: #ccc;
+  }
+`;
+
+// 자동 라벨 / 커스텀 라벨 처리 헬퍼
 const getBookmarkDisplayLabel = (label, idx) => {
   const trimmed = (label || "").trim();
-  const autoPattern = /^즐겨찾기\d+$/; // 시스템이 만든 기본 라벨 패턴
 
-  // 라벨이 없거나, 시스템 라벨이면 index 기반으로 다시 번호 부여
-  if (!trimmed || autoPattern.test(trimmed)) {
+  // label이 비어 있을 때만 자동으로 "즐겨찾기N" 생성
+  if (!trimmed) {
     return `즐겨찾기${idx + 1}`;
   }
 
-  // 사용자가 바꾼 라벨은 그대로 사용
+  // 한 번이라도 사용자가 입력한 값은 그대로 사용
   return trimmed;
 };
 
@@ -334,6 +427,57 @@ const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
 const INITIAL_SCALE = 1.0;
 
+// 형광펜 색상
+const DEFAULT_HIGHLIGHT_COLOR = "rgba(255, 255, 0, 0.35)";
+
+// PDF 페이지 위에 텍스트 레이어(span들)를 직접 그리는 헬퍼
+const renderTextLayerOnPage = async (page, viewport, container) => {
+  if (!container) return;
+
+  const textContent = await page.getTextContent();
+
+  container.innerHTML = "";
+  container.style.width = `${viewport.width}px`;
+  container.style.height = `${viewport.height}px`;
+  container.style.position = "absolute";
+  container.style.left = "0";
+  container.style.top = "0";
+  container.style.pointerEvents = "none";
+
+  const textItems = textContent.items || [];
+  const styles = textContent.styles || {};
+
+  const frag = document.createDocumentFragment();
+
+  textItems.forEach((item) => {
+    const text = item.str || "";
+    if (!text) return;
+
+    const mm = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const fontHeight = Math.hypot(mm[2], mm[3]);
+    const x = mm[4];
+    const y = mm[5];
+
+    const span = document.createElement("span");
+    span.textContent = text;
+    span.style.position = "absolute";
+    span.style.whiteSpace = "pre";
+    span.style.fontSize = `${fontHeight}px`;
+
+    const font = styles[item.fontName];
+    if (font && font.fontFamily) {
+      span.style.fontFamily = font.fontFamily;
+    }
+
+    span.style.left = `${x}px`;
+    span.style.top = `${y - fontHeight}px`;
+
+    frag.appendChild(span);
+  });
+
+  container.appendChild(frag);
+};
+
 export default function PdfViewerWithBookmarks() {
   const [pdf, setPdf] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
@@ -342,85 +486,295 @@ export default function PdfViewerWithBookmarks() {
 
   const [bookmarks, setBookmarks] = useState([]);
   const [fileName, setFileName] = useState("");
-  const [collapsedFiles, setCollapsedFiles] = useState({});
   const [thumbnails, setThumbnails] = useState([]);
 
-  // 폴더: { id, fileName, name, createdAt }
-  const [folders, setFolders] = useState([]);
+  // 페이지 텍스트 (텍스트 검색용)
+  const [pageTexts, setPageTexts] = useState([]);
 
-  // 확대/축소 비율
+  // 검색 상태
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatches, setSearchMatches] = useState([]); // { page, start, end }
+  const [searchIndex, setSearchIndex] = useState(0);
+
+  // 전역 폴더
+  const [folders, setFolders] = useState([]);
+  const [editingFolderId, setEditingFolderId] = useState(null);
+  const [editingFolderName, setEditingFolderName] = useState("");
+  const [collapsedFolders, setCollapsedFolders] = useState({});
+
+  // 확대/축소
   const [scale, setScale] = useState(INITIAL_SCALE);
 
+  // 오른쪽 사이드바 너비 상태
+  const [rightSidebarWidth, setRightSidebarWidth] = useState(320);
+  const rightDragActiveRef = useRef(false);
+  const rightDragStartXRef = useRef(0);
+  const rightDragStartWidthRef = useRef(320);
+
+  // 왼쪽/오른쪽 접힘 상태
+  const [isLeftCollapsed, setIsLeftCollapsed] = useState(false);
+  const [isRightCollapsed, setIsRightCollapsed] = useState(false);
+
   const canvasRefs = useRef([]);
+  const textLayerRefs = useRef([]); // 텍스트 레이어 ref
   const mainRef = useRef(null);
   const toolbarRef = useRef(null);
   const scrollTickingRef = useRef(false);
 
-  // 썸네일 자동 스크롤용 ref
   const sidebarRef = useRef(null);
   const thumbnailRefs = useRef([]);
 
-  // 현재 수정 중인 북마크
   const [editingKey, setEditingKey] = useState(null);
   const [editingLabel, setEditingLabel] = useState("");
 
-  // ✅ 현재 수정 중인 폴더
-  const [editingFolderId, setEditingFolderId] = useState(null);
-  const [editingFolderName, setEditingFolderName] = useState("");
+  // 형광펜 / 지우개 상태
+  const [isHighlightMode, setIsHighlightMode] = useState(false);
+  const [isEraseMode, setIsEraseMode] = useState(false);
+  const [highlights, setHighlights] = useState([]); // {id,fileName,page,x,y,width,height,color}
+  const highlightStartRef = useRef(null);
 
-  // ✅ 폴더 접힘 상태
-  const [collapsedFolders, setCollapsedFolders] = useState({});
+  // PDF 문서 캐시 (세션 동안만 유지)
+  const pdfCacheRef = useRef({});
 
-  // 북마크 / 폴더 로드
+  // 썸네일 렌더 세대 관리 (파일 전환시 이전 비동기 결과 무시)
+  const thumbnailGenerationRef = useRef(0);
+
+  // 컨텍스트 메뉴 상태
+  const [contextMenu, setContextMenu] = useState({
+    visible: false,
+    x: 0,
+    y: 0,
+    type: null, // 'folder' | 'bookmark'
+    target: null, // { folderId } or { key }
+  });
+
+  // 폴더 변경 모달 상태
+  const [folderDialog, setFolderDialog] = useState({
+    visible: false,
+    bookmarkKey: null,
+    value: "",
+  });
+
+  // 로컬 스토리지 로드
   useEffect(() => {
     const saved = localStorage.getItem("gyul-pdf-bookmarks");
     if (saved) setBookmarks(JSON.parse(saved));
 
     const savedFolders = localStorage.getItem("gyul-pdf-folders");
     if (savedFolders) setFolders(JSON.parse(savedFolders));
+
+    const savedHighlights = localStorage.getItem("gyul-pdf-highlights");
+    if (savedHighlights) setHighlights(JSON.parse(savedHighlights));
   }, []);
 
-  // 북마크 저장
+  // 저장
   useEffect(() => {
     localStorage.setItem("gyul-pdf-bookmarks", JSON.stringify(bookmarks));
   }, [bookmarks]);
 
-  // 폴더 저장
   useEffect(() => {
     localStorage.setItem("gyul-pdf-folders", JSON.stringify(folders));
   }, [folders]);
 
-  // currentPage → 입력칸 동기화
+  useEffect(() => {
+    localStorage.setItem("gyul-pdf-highlights", JSON.stringify(highlights));
+  }, [highlights]);
+
+  // 페이지 입력 동기화
   useEffect(() => {
     setPageInput(String(currentPage));
   }, [currentPage]);
 
-  // 한 페이지 렌더 (현재 scale 사용)
+  // Ctrl+Z 되돌리기 (현재 파일의 마지막 형광펜 삭제)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        setHighlights((prev) => {
+          if (!fileName) return prev;
+          let targetIndex = -1;
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].fileName === fileName) {
+              targetIndex = i;
+              break;
+            }
+          }
+          if (targetIndex === -1) return prev;
+          const next = [...prev];
+          next.splice(targetIndex, 1);
+          return next;
+        });
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [fileName]);
+
+  // 컨텍스트 메뉴 닫기 (어디든 클릭/스크롤 시)
+  useEffect(() => {
+    const handleGlobalClick = () => {
+      setContextMenu((prev) =>
+        prev.visible
+          ? { visible: false, x: 0, y: 0, type: null, target: null }
+          : prev
+      );
+    };
+
+    window.addEventListener("click", handleGlobalClick);
+    window.addEventListener("scroll", handleGlobalClick, true);
+
+    return () => {
+      window.removeEventListener("click", handleGlobalClick);
+      window.removeEventListener("scroll", handleGlobalClick, true);
+    };
+  }, []);
+
+  // 오른쪽 사이드바 리사이즈용 전역 mousemove / mouseup
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!rightDragActiveRef.current || isRightCollapsed) return;
+
+      const delta = rightDragStartXRef.current - e.clientX;
+      const MIN_WIDTH = 200;
+      const MAX_WIDTH = 600;
+
+      let newWidth = rightDragStartWidthRef.current + delta;
+      if (newWidth < MIN_WIDTH) newWidth = MIN_WIDTH;
+      if (newWidth > MAX_WIDTH) newWidth = MAX_WIDTH;
+
+      setRightSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      if (rightDragActiveRef.current) {
+        rightDragActiveRef.current = false;
+      }
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isRightCollapsed]);
+
+  const handleRightResizeMouseDown = (e) => {
+    e.preventDefault();
+    if (isRightCollapsed) return;
+    rightDragActiveRef.current = true;
+    rightDragStartXRef.current = e.clientX;
+    rightDragStartWidthRef.current = rightSidebarWidth;
+  };
+
+  // 형광펜 영역 그리기
+  const drawHighlightsForPage = (pageNum) => {
+    if (!pdf) return;
+    const canvas = canvasRefs.current[pageNum - 1];
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const pageHighlights = highlights.filter(
+      (h) => h.fileName === fileName && h.page === pageNum
+    );
+    if (pageHighlights.length === 0) return;
+
+    ctx.save();
+    pageHighlights.forEach((h) => {
+      const x = h.x * canvas.width;
+      const y = h.y * canvas.height;
+      const w = h.width * canvas.width;
+      const hgt = h.height * canvas.height;
+      ctx.fillStyle = h.color || DEFAULT_HIGHLIGHT_COLOR;
+      ctx.fillRect(x, y, w, hgt);
+    });
+    ctx.restore();
+  };
+
+  // 검색된 텍스트만 하이라이트
+  const applySearchHighlightForPage = (pageNum) => {
+    const q = searchQuery.trim();
+    if (!q) return;
+
+    const textLayerDiv = textLayerRefs.current[pageNum - 1];
+    if (!textLayerDiv) return;
+
+    const lowerQ = q.toLowerCase();
+    const spans = textLayerDiv.querySelectorAll("span");
+
+    spans.forEach((span) => {
+      const fullText = span.textContent || "";
+      const lowerText = fullText.toLowerCase();
+
+      let index = lowerText.indexOf(lowerQ);
+      if (index === -1) return;
+
+      const frag = document.createDocumentFragment();
+      let lastIndex = 0;
+
+      while (index !== -1) {
+        if (index > lastIndex) {
+          frag.appendChild(
+            document.createTextNode(fullText.slice(lastIndex, index))
+          );
+        }
+        const mark = document.createElement("span");
+        mark.textContent = fullText.slice(index, index + q.length);
+        mark.style.backgroundColor = "rgba(10, 59, 255, 1)";
+        frag.appendChild(mark);
+        lastIndex = index + q.length;
+        index = lowerText.indexOf(lowerQ, lastIndex);
+      }
+
+      if (lastIndex < fullText.length) {
+        frag.appendChild(document.createTextNode(fullText.slice(lastIndex)));
+      }
+
+      span.innerHTML = "";
+      span.appendChild(frag);
+    });
+  };
+
+  // 한 페이지 렌더
   const renderPage = async (num, scaleValue = scale) => {
     if (!pdf) return;
     const canvas = canvasRefs.current[num - 1];
-    if (!canvas) return;
+    const textLayerDiv = textLayerRefs.current[num - 1];
+    if (!canvas || !textLayerDiv) return;
 
     const page = await pdf.getPage(num);
     const viewport = page.getViewport({ scale: scaleValue });
     const ctx = canvas.getContext("2d");
+
     canvas.height = viewport.height;
     canvas.width = viewport.width;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
     await page.render({ canvasContext: ctx, viewport }).promise;
+
+    await renderTextLayerOnPage(page, viewport, textLayerDiv);
+
+    drawHighlightsForPage(num);
+    applySearchHighlightForPage(num);
   };
 
-  // 전체 페이지 렌더 (병렬 최적화 + scale 반영)
+  // 전체 페이지 렌더
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
 
     let cancelled = false;
     const MAX_CONCURRENT = 4;
-
     const queue = Array.from({ length: totalPages }, (_, i) => i + 1);
 
     const worker = async () => {
       while (!cancelled && queue.length) {
         const pageNum = queue.shift();
+        if (!pageNum) break;
         try {
           await renderPage(pageNum, scale);
         } catch (e) {
@@ -437,15 +791,16 @@ export default function PdfViewerWithBookmarks() {
     return () => {
       cancelled = true;
     };
-  }, [pdf, totalPages, scale]);
+  }, [pdf, totalPages, scale, highlights, searchMatches]);
 
-  // 썸네일 생성 (배치 처리, 고정 0.2배)
-  const generateThumbnails = async (pdfDoc) => {
+  // 썸네일 생성 (세대 ID 사용)
+  const generateThumbnails = async (pdfDoc, generation) => {
     const total = pdfDoc.numPages;
-    const thumbsArray = new Array(total).fill(null);
     const BATCH_SIZE = 5;
 
     for (let start = 1; start <= total; start += BATCH_SIZE) {
+      if (thumbnailGenerationRef.current !== generation) return;
+
       const end = Math.min(start + BATCH_SIZE - 1, total);
       const batchPromises = [];
 
@@ -467,18 +822,20 @@ export default function PdfViewerWithBookmarks() {
       }
 
       const batchResults = await Promise.all(batchPromises);
-      batchResults.forEach(({ index, dataUrl }) => {
-        thumbsArray[index] = dataUrl;
-      });
+
+      if (thumbnailGenerationRef.current !== generation) return;
 
       setThumbnails((prev) => {
-        if (!prev || prev.length !== total) {
-          return [...thumbsArray];
-        }
-        const next = [...prev];
+        const length = total;
+        const next =
+          prev && prev.length === length
+            ? [...prev]
+            : new Array(length).fill(null);
+
         batchResults.forEach(({ index, dataUrl }) => {
           next[index] = dataUrl;
         });
+
         return next;
       });
     }
@@ -486,19 +843,77 @@ export default function PdfViewerWithBookmarks() {
 
   // 파일 열기
   const handleFile = async (e) => {
-    const file = e.target.files[0];
+    const file = e.target.files?.[0];
     if (!file) return;
-    setFileName(file.name);
+
+    const name = file.name;
+    setFileName(name);
+
     const arrayBuffer = await file.arrayBuffer();
     const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    pdfCacheRef.current[name] = pdfDoc;
+
+    const newGeneration = thumbnailGenerationRef.current + 1;
+    thumbnailGenerationRef.current = newGeneration;
+
+    setThumbnails(new Array(pdfDoc.numPages).fill(null));
+
     setPdf(pdfDoc);
     setTotalPages(pdfDoc.numPages);
     setCurrentPage(1);
-    setScale(INITIAL_SCALE); // 새 파일 열 때 줌 초기화
-    generateThumbnails(pdfDoc);
+    setScale(INITIAL_SCALE);
+
+    // 검색 관련 상태 리셋
+    setPageTexts([]);
+    setSearchMatches([]);
+    setSearchIndex(0);
+    setSearchQuery("");
+
+    generateThumbnails(pdfDoc, newGeneration);
   };
 
-  // Main 컨테이너 기준 offsetTop 계산해서 스크롤
+  // === 페이지 텍스트 추출 (텍스트 검색용) ===
+  useEffect(() => {
+    if (!pdf || totalPages === 0) {
+      setPageTexts([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const extractTexts = async () => {
+      const texts = [];
+      for (let i = 1; i <= totalPages; i++) {
+        if (cancelled) return;
+        try {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          let fullText = "";
+          textContent.items.forEach((item) => {
+            const str = item.str || "";
+            if (!str) return;
+            if (fullText) fullText += " ";
+            fullText += str;
+          });
+          texts.push(fullText);
+        } catch (e) {
+          texts.push("");
+        }
+      }
+      if (!cancelled) {
+        setPageTexts(texts);
+      }
+    };
+
+    extractTexts();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pdf, totalPages]);
+
+  // 스크롤 위치 계산
   const scrollToPage = (pageNum) => {
     const canvas = canvasRefs.current[pageNum - 1];
     const container = mainRef.current;
@@ -522,13 +937,13 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // 이 페이지가 북마크 되어 있는지 확인
+  // 북마크 여부
   const isPageBookmarked = (pageNum) => {
     if (!fileName) return false;
     return bookmarks.some((b) => b.fileName === fileName && b.page === pageNum);
   };
 
-  // 특정 페이지 북마크 토글
+  // 북마크 토글
   const toggleBookmarkPage = (pageNum) => {
     if (!fileName) return;
     const key = `${fileName}-${pageNum}`;
@@ -536,7 +951,6 @@ export default function PdfViewerWithBookmarks() {
     setBookmarks((prev) => {
       const exists = prev.some((b) => b.key === key);
       if (exists) {
-        // 이미 있으면 제거
         return prev.filter((b) => b.key !== key);
       }
 
@@ -546,7 +960,7 @@ export default function PdfViewerWithBookmarks() {
         page: pageNum,
         date: new Date().toLocaleString(),
         label: "",
-        folderId: null, // 처음엔 폴더 없음
+        folderId: null,
       };
       return [...prev, newBookmark];
     });
@@ -554,14 +968,13 @@ export default function PdfViewerWithBookmarks() {
 
   // 페이지 점프
   const jumpToPage = (pageNum) => {
-    if (!pdf || totalPages === 0) return;
+    if (!totalPages) return;
     const target = Math.min(Math.max(pageNum, 1), totalPages);
-
-    renderPage(target); // 현재 scale로 렌더
+    setCurrentPage(target);
     scrollToPage(target);
   };
 
-  // 스크롤 시 현재 페이지 계산 (rAF throttle)
+  // 스크롤 시 현재 페이지 계산
   const handleScroll = () => {
     const container = mainRef.current;
     const toolbar = toolbarRef.current;
@@ -596,7 +1009,7 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // Ctrl + 마우스 휠로 줌 인/아웃
+  // Ctrl + 휠 줌
   const handleWheel = (e) => {
     if (!e.ctrlKey) return;
     e.preventDefault();
@@ -610,7 +1023,7 @@ export default function PdfViewerWithBookmarks() {
     });
   };
 
-  // 현재 페이지가 바뀔 때, 왼쪽 썸네일을 중앙으로 스크롤
+  // 썸네일 자동 스크롤
   useEffect(() => {
     if (!sidebarRef.current) return;
     const container = sidebarRef.current;
@@ -634,7 +1047,7 @@ export default function PdfViewerWithBookmarks() {
     });
   }, [currentPage]);
 
-  // 북마크 추가 (상단 버튼) → 현재 페이지 토글
+  // 북마크 추가
   const addBookmark = () => {
     if (!fileName) return;
     toggleBookmarkPage(currentPage);
@@ -644,31 +1057,45 @@ export default function PdfViewerWithBookmarks() {
     setBookmarks((prev) => prev.filter((b) => b.key !== key));
   };
 
-  const goToBookmark = (bm) => {
-    if (fileName !== bm.fileName) {
+  // 북마크로 이동
+  const goToBookmark = async (bm) => {
+    if (fileName === bm.fileName && pdf) {
+      jumpToPage(bm.page);
+      return;
+    }
+
+    const cachedDoc = pdfCacheRef.current[bm.fileName];
+    if (!cachedDoc) {
       alert(
-        "이 북마크는 다른 파일에 속해 있습니다. 먼저 해당 파일을 열어주세요."
+        `이 북마크의 PDF("${bm.fileName}")는 현재 메모리에 없습니다.\n먼저 해당 파일을 한 번 열어주세요.`
       );
       return;
     }
-    jumpToPage(bm.page);
+
+    const newGeneration = thumbnailGenerationRef.current + 1;
+    thumbnailGenerationRef.current = newGeneration;
+
+    setThumbnails(new Array(cachedDoc.numPages).fill(null));
+
+    setPdf(cachedDoc);
+    setFileName(bm.fileName);
+    setTotalPages(cachedDoc.numPages);
+    setScale(INITIAL_SCALE);
+    setCurrentPage(bm.page);
+
+    generateThumbnails(cachedDoc, newGeneration);
+
+    setTimeout(() => {
+      scrollToPage(bm.page);
+    }, 200);
   };
 
-  const toggleFile = (file) => {
-    setCollapsedFiles((prev) => ({
-      ...prev,
-      [file]: !prev[file],
-    }));
-  };
-
-  // 폴더 생성
-  const handleAddFolder = (file) => {
+  // 전역 폴더 추가
+  const handleAddFolder = () => {
     setFolders((prev) => {
-      const fileFolders = prev.filter((f) => f.fileName === file);
-      const nextIndex = fileFolders.length + 1;
+      const nextIndex = prev.length + 1;
       const newFolder = {
-        id: `${file}-folder-${Date.now()}-${nextIndex}`,
-        fileName: file,
+        id: `folder-${Date.now()}-${nextIndex}`,
         name: `폴더${nextIndex}`,
         createdAt: new Date().toLocaleString(),
       };
@@ -676,13 +1103,12 @@ export default function PdfViewerWithBookmarks() {
     });
   };
 
-  // ✅ 폴더 이름 수정 시작
+  // 폴더 이름 수정
   const startEditFolder = (folder) => {
     setEditingFolderId(folder.id);
     setEditingFolderName(folder.name);
   };
 
-  // ✅ 폴더 이름 저장
   const saveEditFolder = (folderId) => {
     setFolders((prev) =>
       prev.map((f) =>
@@ -695,13 +1121,11 @@ export default function PdfViewerWithBookmarks() {
     setEditingFolderName("");
   };
 
-  // ✅ 폴더 이름 수정 취소
   const cancelEditFolder = () => {
     setEditingFolderId(null);
     setEditingFolderName("");
   };
 
-  // ✅ 폴더 접기/펼치기 토글
   const toggleFolderCollapse = (folderId) => {
     setCollapsedFolders((prev) => ({
       ...prev,
@@ -709,7 +1133,39 @@ export default function PdfViewerWithBookmarks() {
     }));
   };
 
-  // 북마크 폴더 변경
+  // 폴더 삭제: 폴더는 제거, 폴더 안 즐겨찾기는 "폴더 없음"으로 이동
+  const handleDeleteFolder = (folderId) => {
+    const folder = folders.find((f) => f.id === folderId);
+    const name = folder ? folder.name : "";
+
+    if (
+      !window.confirm(
+        `"${name}" 폴더를 삭제하시겠습니까?\n(폴더 안 즐겨찾기는 삭제되지 않고, '폴더 없음'으로 이동합니다.)`
+      )
+    ) {
+      return;
+    }
+
+    setFolders((prev) => prev.filter((f) => f.id !== folderId));
+
+    setBookmarks((prev) =>
+      prev.map((bm) =>
+        bm.folderId === folderId ? { ...bm, folderId: null } : bm
+      )
+    );
+
+    setCollapsedFolders((prev) => {
+      const next = { ...prev };
+      delete next[folderId];
+      return next;
+    });
+
+    if (editingFolderId === folderId) {
+      setEditingFolderId(null);
+      setEditingFolderName("");
+    }
+  };
+
   const handleChangeBookmarkFolder = (bookmarkKey, folderId) => {
     setBookmarks((prev) =>
       prev.map((bm) =>
@@ -718,13 +1174,11 @@ export default function PdfViewerWithBookmarks() {
     );
   };
 
-  // 북마크 이름 수정 시작
   const startEditBookmark = (bm, displayLabel) => {
     setEditingKey(bm.key);
     setEditingLabel(displayLabel);
   };
 
-  // 북마크 이름 저장
   const saveEditBookmark = (key) => {
     setBookmarks((prev) =>
       prev.map((bm) =>
@@ -735,29 +1189,12 @@ export default function PdfViewerWithBookmarks() {
     setEditingLabel("");
   };
 
-  // 북마크 이름 수정 취소
   const cancelEditBookmark = () => {
     setEditingKey(null);
     setEditingLabel("");
   };
 
-  const groupedBookmarks = useMemo(() => {
-    return bookmarks.reduce((acc, bm) => {
-      if (!acc[bm.fileName]) acc[bm.fileName] = [];
-      acc[bm.fileName].push(bm);
-      return acc;
-    }, {});
-  }, [bookmarks]);
-
-  const foldersByFile = useMemo(() => {
-    return folders.reduce((acc, folder) => {
-      if (!acc[folder.fileName]) acc[folder.fileName] = [];
-      acc[folder.fileName].push(folder);
-      return acc;
-    }, {});
-  }, [folders]);
-
-  // 확대/축소 버튼 핸들러
+  // 줌 핸들러
   const handleZoomIn = () => {
     setScale((prev) => Math.min(prev + SCALE_STEP, MAX_SCALE));
   };
@@ -770,44 +1207,366 @@ export default function PdfViewerWithBookmarks() {
     setScale(INITIAL_SCALE);
   };
 
+  // 지우개: 해당 점에 걸린 마지막 하이라이트 삭제
+  const eraseHighlightAtPoint = (pageNum, e) => {
+    if (!fileName) return;
+    const canvas = canvasRefs.current[pageNum - 1];
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const xNorm = (e.clientX - rect.left) / canvas.width;
+    const yNorm = (e.clientY - rect.top) / canvas.height;
+
+    setHighlights((prev) => {
+      let targetIndex = -1;
+      for (let i = prev.length - 1; i >= 0; i--) {
+        const h = prev[i];
+        if (h.fileName !== fileName || h.page !== pageNum) continue;
+        if (
+          xNorm >= h.x &&
+          xNorm <= h.x + h.width &&
+          yNorm >= h.y &&
+          yNorm <= h.y + h.height
+        ) {
+          targetIndex = i;
+          break;
+        }
+      }
+      if (targetIndex === -1) return prev;
+      const next = [...prev];
+      next.splice(targetIndex, 1);
+      return next;
+    });
+  };
+
+  // 형광펜: 캔버스 마우스 다운 & 전역 마우스 업
+  const handleCanvasMouseDown = (pageNum) => (e) => {
+    if (isEraseMode) {
+      eraseHighlightAtPoint(pageNum, e);
+      return;
+    }
+
+    if (!isHighlightMode || !fileName) return;
+
+    const canvas = canvasRefs.current[pageNum - 1];
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+
+    highlightStartRef.current = {
+      page: pageNum,
+      rect,
+      canvasWidth: canvas.width,
+      canvasHeight: canvas.height,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+    };
+
+    const onMouseUp = (ev) => {
+      if (!highlightStartRef.current) {
+        window.removeEventListener("mouseup", onMouseUp);
+        return;
+      }
+
+      const {
+        page,
+        rect: startRect,
+        canvasWidth,
+        canvasHeight,
+        startClientX,
+        startClientY,
+      } = highlightStartRef.current;
+
+      highlightStartRef.current = null;
+      window.removeEventListener("mouseup", onMouseUp);
+
+      const endX = ev.clientX - startRect.left;
+      const endY = ev.clientY - startRect.top;
+      const startX = startClientX - startRect.left;
+      const startY = startClientY - startRect.top;
+
+      const normStartX = startX / canvasWidth;
+      const normStartY = startY / canvasHeight;
+      const normEndX = endX / canvasWidth;
+      const normEndY = endY / canvasHeight;
+
+      const rawWidth = Math.abs(normStartX - normEndX);
+      const rawHeight = Math.abs(normStartY - normEndY);
+
+      const MIN_WIDTH = 0.005;
+      if (rawWidth < MIN_WIDTH) return;
+
+      const MIN_LINE_HEIGHT = 0.02;
+      let width = rawWidth;
+      let height;
+      let minX;
+      let minY;
+
+      minX = Math.min(normStartX, normEndX);
+
+      if (rawHeight < MIN_LINE_HEIGHT) {
+        const centerY = (normStartY + normEndY) / 2;
+        height = MIN_LINE_HEIGHT;
+        minY = centerY - height / 2;
+        if (minY < 0) minY = 0;
+        if (minY + height > 1) minY = 1 - height;
+      } else {
+        height = rawHeight;
+        minY = Math.min(normStartY, normEndY);
+      }
+
+      setHighlights((prev) => [
+        ...prev,
+        {
+          id: `${fileName}-${page}-${Date.now()}-${Math.random()}`,
+          fileName,
+          page,
+          x: minX,
+          y: minY,
+          width,
+          height,
+          color: DEFAULT_HIGHLIGHT_COLOR,
+        },
+      ]);
+    };
+
+    window.addEventListener("mouseup", onMouseUp);
+  };
+
+  // 전역 북마크 인덱스 (자동 라벨용)
+  const indexMap = {};
+  bookmarks.forEach((bm, idx) => {
+    indexMap[bm.key] = idx;
+  });
+
+  const unassignedBookmarks = bookmarks.filter((bm) => !bm.folderId);
+
+  // === 텍스트 검색 로직 ===
+  const handleSearch = () => {
+    const q = searchQuery.trim();
+    if (!q || pageTexts.length === 0) {
+      setSearchMatches([]);
+      setSearchIndex(0);
+      return;
+    }
+
+    const lowerQ = q.toLowerCase();
+    const matches = [];
+
+    pageTexts.forEach((text, idx) => {
+      if (!text) return;
+      const lowerText = text.toLowerCase();
+      let pos = lowerText.indexOf(lowerQ);
+      while (pos !== -1) {
+        matches.push({
+          page: idx + 1,
+          start: pos,
+          end: pos + q.length,
+        });
+        pos = lowerText.indexOf(lowerQ, pos + q.length);
+      }
+    });
+
+    setSearchMatches(matches);
+    if (matches.length > 0) {
+      setSearchIndex(0);
+      jumpToPage(matches[0].page);
+    } else {
+      setSearchIndex(0);
+    }
+  };
+
+  const gotoMatch = (nextIndex) => {
+    if (searchMatches.length === 0) return;
+    const len = searchMatches.length;
+    let idx = ((nextIndex % len) + len) % len;
+    setSearchIndex(idx);
+    const match = searchMatches[idx];
+    jumpToPage(match.page);
+  };
+
+  const hasSearchResults = searchMatches.length > 0;
+
+  // === 컨텍스트 메뉴 핸들러 ===
+  const handleFolderContextMenu = (e, folder) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({
+      visible: true,
+      x: e.clientX,
+      y: e.clientY,
+      type: "folder",
+      target: { folderId: folder.id },
+    });
+  };
+
+  const handleBookmarkContextMenu = (e, bm) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({
+      visible: true,
+      x: e.clientX,
+      y: e.clientY,
+      type: "bookmark",
+      target: { key: bm.key },
+    });
+  };
+
+  const closeContextMenu = () => {
+    setContextMenu({ visible: false, x: 0, y: 0, type: null, target: null });
+  };
+
+  const handleFolderRenameFromMenu = () => {
+    if (!contextMenu.target) return;
+    const folder = folders.find((f) => f.id === contextMenu.target.folderId);
+    if (folder) {
+      startEditFolder(folder);
+    }
+    closeContextMenu();
+  };
+
+  const handleFolderDeleteFromMenu = () => {
+    if (!contextMenu.target) return;
+    handleDeleteFolder(contextMenu.target.folderId);
+    closeContextMenu();
+  };
+
+  const handleBookmarkFolderChangeFromMenu = () => {
+    if (!contextMenu.target) return;
+    const bm = bookmarks.find((b) => b.key === contextMenu.target.key);
+    if (!bm) return;
+
+    setFolderDialog({
+      visible: true,
+      bookmarkKey: bm.key,
+      value: bm.folderId || "",
+    });
+    closeContextMenu();
+  };
+
+  const handleBookmarkRenameFromMenu = () => {
+    if (!contextMenu.target) return;
+    const bm = bookmarks.find((b) => b.key === contextMenu.target.key);
+    if (bm) {
+      const displayLabel = getBookmarkDisplayLabel(bm.label, indexMap[bm.key]);
+      startEditBookmark(bm, displayLabel);
+    }
+    closeContextMenu();
+  };
+
+  const handleBookmarkDeleteFromMenu = () => {
+    if (!contextMenu.target) return;
+    removeBookmark(contextMenu.target.key);
+    closeContextMenu();
+  };
+
+  const closeFolderDialog = () => {
+    setFolderDialog({
+      visible: false,
+      bookmarkKey: null,
+      value: "",
+    });
+  };
+
+  const confirmFolderDialog = () => {
+    if (!folderDialog.bookmarkKey) {
+      closeFolderDialog();
+      return;
+    }
+    handleChangeBookmarkFolder(folderDialog.bookmarkKey, folderDialog.value);
+    closeFolderDialog();
+  };
+
+  // === 렌더링 ===
   return (
     <Container>
-      {/* 왼쪽 썸네일 */}
-      <Sidebar ref={sidebarRef}>
-        <h3>📄 페이지</h3>
-        {thumbnails.map((src, idx) => {
-          const pageNum = idx + 1;
-          const bookmarked = isPageBookmarked(pageNum);
-
-          return (
-            <PageThumbnail
-              key={idx}
-              ref={(el) => (thumbnailRefs.current[idx] = el)}
-              active={currentPage === pageNum}
-              onClick={() => jumpToPage(pageNum)}
+      {/* 왼쪽 페이지 탭 (접힘/펼침) */}
+      {isLeftCollapsed ? (
+        <LeftCollapsedTab onClick={() => setIsLeftCollapsed(false)}>
+          📄 페이지
+        </LeftCollapsedTab>
+      ) : (
+        <Sidebar ref={sidebarRef}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 8,
+            }}
+          >
+            <h3 style={{ margin: 0 }}>📄 페이지</h3>
+            <button
+              type="button"
+              style={{
+                border: "none",
+                background: "none",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+              onClick={() => setIsLeftCollapsed(true)}
             >
-              {/* 썸네일 상단 북마크 아이콘 */}
-              <ThumbnailIconButton
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleBookmarkPage(pageNum);
-                }}
-              >
-                <ThumbnailIcon
-                  src={bookmarked ? onSvg : offSvg}
-                  alt={bookmarked ? "bookmarked" : "not bookmarked"}
-                />
-              </ThumbnailIconButton>
+              접기
+            </button>
+          </div>
+          {thumbnails.map((src, idx) => {
+            const pageNum = idx + 1;
+            const bookmarked = isPageBookmarked(pageNum);
 
-              <img src={src} alt={`Page ${pageNum}`} />
-              <ThumbnailPageNumber>{pageNum}</ThumbnailPageNumber>
-            </PageThumbnail>
-          );
-        })}
-      </Sidebar>
+            return (
+              <PageThumbnail
+                key={idx}
+                ref={(el) => {
+                  if (el) thumbnailRefs.current[idx] = el;
+                }}
+                active={currentPage === pageNum}
+                onClick={() => jumpToPage(pageNum)}
+              >
+                <ThumbnailIconButton
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleBookmarkPage(pageNum);
+                  }}
+                >
+                  <ThumbnailIcon
+                    src={bookmarked ? onSvg : offSvg}
+                    alt={bookmarked ? "bookmarked" : "not bookmarked"}
+                  />
+                </ThumbnailIconButton>
+
+                {src ? (
+                  <img src={src} alt={`Page ${pageNum}`} />
+                ) : (
+                  <div
+                    style={{
+                      width: "100%",
+                      paddingTop: "141%",
+                      background: "#f5f5f5",
+                      fontSize: "10px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#999",
+                    }}
+                  >
+                    로딩 중...
+                  </div>
+                )}
+
+                <ThumbnailPageNumber>{pageNum}</ThumbnailPageNumber>
+              </PageThumbnail>
+            );
+          })}
+        </Sidebar>
+      )}
 
       {/* 중앙 본문 */}
-      <Main ref={mainRef} onScroll={handleScroll} onWheel={handleWheel}>
+      <Main
+        ref={mainRef}
+        onScroll={handleScroll}
+        onWheel={handleWheel}
+        $highlight={isHighlightMode || isEraseMode}
+      >
         <Toolbar ref={toolbarRef}>
           <input type="file" accept="application/pdf" onChange={handleFile} />
           {pdf && (
@@ -851,7 +1610,141 @@ export default function PdfViewerWithBookmarks() {
 
               <button onClick={addBookmark}>⭐ 북마크 추가</button>
 
-              {/* 오른쪽 끝 확대/축소 컨트롤 */}
+              {/* 형광펜 토글 */}
+              <button
+                type="button"
+                onClick={() =>
+                  setIsHighlightMode((prev) => {
+                    const next = !prev;
+                    if (next) setIsEraseMode(false);
+                    return next;
+                  })
+                }
+                style={{
+                  padding: "4px 8px",
+                  fontSize: "12px",
+                  borderRadius: "4px",
+                  border: "1px solid #ccc",
+                  background: isHighlightMode ? "#fff7c2" : "#f8f8f8",
+                  cursor: "pointer",
+                }}
+              >
+                🖍 형광펜 {isHighlightMode ? "ON" : "OFF"}
+              </button>
+
+              {/* 지우개 토글 */}
+              <button
+                type="button"
+                onClick={() =>
+                  setIsEraseMode((prev) => {
+                    const next = !prev;
+                    if (next) setIsHighlightMode(false);
+                    return next;
+                  })
+                }
+                style={{
+                  padding: "4px 8px",
+                  fontSize: "12px",
+                  borderRadius: "4px",
+                  border: "1px solid #ccc",
+                  background: isEraseMode ? "#ffe4e4" : "#f8f8f8",
+                  cursor: "pointer",
+                }}
+              >
+                🧽 지우개 {isEraseMode ? "ON" : "OFF"}
+              </button>
+
+              {/* 텍스트 검색 영역 */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  marginLeft: 8,
+                }}
+              >
+                <input
+                  type="text"
+                  placeholder="텍스트 검색"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      // 엔터로 검색 실행 및 다음 결과 이동
+                      if (!hasSearchResults) {
+                        handleSearch();
+                      } else {
+                        gotoMatch(searchIndex + 1);
+                      }
+                    }
+                  }}
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 4px",
+                    borderRadius: 4,
+                    border: "1px solid #ccc",
+                    minWidth: 140,
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={handleSearch}
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 6px",
+                    borderRadius: 4,
+                    border: "1px solid #ccc",
+                    background: "#f8f8f8",
+                    cursor: "pointer",
+                  }}
+                >
+                  검색
+                </button>
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "#666",
+                    minWidth: 60,
+                    textAlign: "center",
+                  }}
+                >
+                  {hasSearchResults
+                    ? `${searchIndex + 1} / ${searchMatches.length}`
+                    : ""}
+                </span>
+                <button
+                  type="button"
+                  disabled={!hasSearchResults}
+                  onClick={() => gotoMatch(searchIndex - 1)}
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 4px",
+                    borderRadius: 4,
+                    border: "1px solid #ccc",
+                    background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
+                    cursor: hasSearchResults ? "pointer" : "default",
+                  }}
+                >
+                  ◀
+                </button>
+                <button
+                  type="button"
+                  disabled={!hasSearchResults}
+                  onClick={() => gotoMatch(searchIndex + 1)}
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 4px",
+                    borderRadius: 4,
+                    border: "1px solid #ccc",
+                    background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
+                    cursor: hasSearchResults ? "pointer" : "default",
+                  }}
+                >
+                  ▶
+                </button>
+              </div>
+
+              {/* 줌 컨트롤 */}
               <ZoomToolbar>
                 <ZoomButton type="button" onClick={handleZoomOut}>
                   -
@@ -870,363 +1763,356 @@ export default function PdfViewerWithBookmarks() {
 
         <PagesWrapper>
           {pdf &&
-            Array.from({ length: totalPages }, (_, i) => (
-              <Canvas key={i} ref={(el) => (canvasRefs.current[i] = el)} />
-            ))}
+            Array.from({ length: totalPages }, (_, i) => {
+              const pageNum = i + 1;
+              return (
+                <PageContainer key={i}>
+                  <Canvas
+                    ref={(el) => {
+                      if (el) canvasRefs.current[i] = el;
+                    }}
+                    onMouseDown={handleCanvasMouseDown(pageNum)}
+                    $highlight={isHighlightMode || isEraseMode}
+                  />
+                  {/* 텍스트 레이어 (검색된 텍스트 하이라이트용) */}
+                  <div
+                    ref={(el) => {
+                      if (el) textLayerRefs.current[i] = el;
+                    }}
+                    className="textLayer"
+                    style={{
+                      position: "absolute",
+                      left: 0,
+                      top: 0,
+                      pointerEvents: "none",
+                    }}
+                  />
+                </PageContainer>
+              );
+            })}
         </PagesWrapper>
       </Main>
 
-      {/* 오른쪽 북마크 */}
-      <RightSidebar>
-        <h3>📑 즐겨찾기</h3>
-        {bookmarks.length === 0 && (
-          <EmptyText>저장된 즐겨찾기가 없습니다.</EmptyText>
-        )}
+      {/* 오른쪽 즐겨찾기 탭 (접힘/펼침 + 리사이즈) */}
+      {isRightCollapsed ? (
+        <RightCollapsedTab onClick={() => setIsRightCollapsed(false)}>
+          📑 즐겨찾기
+        </RightCollapsedTab>
+      ) : (
+        <>
+          <RightResizeHandle onMouseDown={handleRightResizeMouseDown} />
 
-        {Object.entries(groupedBookmarks).map(([file, bms]) => {
-          const fileFolders = foldersByFile[file] || [];
+          <RightSidebar $width={rightSidebarWidth}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: 8,
+              }}
+            >
+              <h3 style={{ margin: 0 }}>📑 즐겨찾기</h3>
+              <button
+                type="button"
+                style={{
+                  border: "none",
+                  background: "none",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+                onClick={() => setIsRightCollapsed(true)}
+              >
+                접기
+              </button>
+            </div>
 
-          // 이 파일의 북마크들에 대해 index 맵(번호 매기기용) 만들기
-          const indexMap = {};
-          bms.forEach((bm, index) => {
-            indexMap[bm.key] = index;
-          });
+            <AddFolderButton type="button" onClick={handleAddFolder}>
+              + 폴더 추가
+            </AddFolderButton>
 
-          const bookmarksWithoutFolder = bms.filter((bm) => !bm.folderId);
+            {folders.length === 0 && (
+              <EmptyText>아직 생성된 폴더가 없습니다.</EmptyText>
+            )}
 
-          const bookmarksByFolderId = {};
-          fileFolders.forEach((folder) => {
-            bookmarksByFolderId[folder.id] = [];
-          });
-          bms.forEach((bm) => {
-            if (bm.folderId && bookmarksByFolderId[bm.folderId]) {
-              bookmarksByFolderId[bm.folderId].push(bm);
-            }
-          });
+            <FolderList>
+              {folders.map((folder) => {
+                const folderBookmarks = bookmarks.filter(
+                  (bm) => bm.folderId === folder.id
+                );
+                const isFolderCollapsed = collapsedFolders[folder.id];
 
-          return (
-            <FileGroup key={file}>
-              <FileHeaderRow>
-                <FileTitle onClick={() => toggleFile(file)}>
-                  {collapsedFiles[file] ? "▶" : "▼"} {file}
-                </FileTitle>
+                return (
+                  <FolderWrapper
+                    key={folder.id}
+                    onContextMenu={(e) => handleFolderContextMenu(e, folder)}
+                  >
+                    <FolderTitleRow>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 4,
+                        }}
+                      >
+                        <FolderToggleButton
+                          type="button"
+                          onClick={() => toggleFolderCollapse(folder.id)}
+                        >
+                          {isFolderCollapsed ? "▶" : "▼"}
+                        </FolderToggleButton>
 
-                <AddFolderButton
-                  type="button"
-                  onClick={() => handleAddFolder(file)}
-                >
-                  + 폴더
-                </AddFolderButton>
-              </FileHeaderRow>
-
-              {!collapsedFiles[file] && (
-                <BookmarkList>
-                  {/* 1) 폴더들 (항상 위에 출력) */}
-                  {fileFolders.map((folder) => {
-                    const folderBookmarks =
-                      bookmarksByFolderId[folder.id] || [];
-                    const isFolderCollapsed = collapsedFolders[folder.id];
-
-                    return (
-                      <FolderWrapper key={folder.id}>
-                        <FolderTitleRow>
-                          {/* 왼쪽: 폴더 토글 + 이름/입력 */}
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 4,
-                            }}
-                          >
-                            <FolderToggleButton
-                              type="button"
-                              onClick={() => toggleFolderCollapse(folder.id)}
-                            >
-                              {isFolderCollapsed ? "▶" : "▼"}
-                            </FolderToggleButton>
-
-                            {editingFolderId === folder.id ? (
-                              <BookmarkLabelInput
-                                autoFocus
-                                value={editingFolderName}
-                                onChange={(e) =>
-                                  setEditingFolderName(e.target.value)
-                                }
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") {
-                                    saveEditFolder(folder.id);
-                                  }
-                                  if (e.key === "Escape") {
-                                    cancelEditFolder();
-                                  }
-                                }}
-                              />
-                            ) : (
-                              <FolderName
-                                onClick={() => startEditFolder(folder)}
-                              >
-                                {folder.name}
-                              </FolderName>
-                            )}
-                          </div>
-
-                          {/* 오른쪽: 폴더 내 북마크 개수 + 버튼들 */}
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 4,
-                              fontSize: 10,
-                              color: "#999",
-                            }}
-                          >
-                            <span>{folderBookmarks.length}개</span>
-
-                            {editingFolderId === folder.id ? (
-                              <>
-                                <ChangeButton
-                                  onClick={() => saveEditFolder(folder.id)}
-                                >
-                                  저장
-                                </ChangeButton>
-                                <CancelButton onClick={cancelEditFolder}>
-                                  취소
-                                </CancelButton>
-                              </>
-                            ) : (
-                              <ChangeButton
-                                onClick={() => startEditFolder(folder)}
-                              >
-                                이름변경
-                              </ChangeButton>
-                            )}
-                          </div>
-                        </FolderTitleRow>
-
-                        {/* 폴더 내용: 접혀있지 않을 때만 표시 */}
-                        {!isFolderCollapsed && (
-                          <FolderBookmarkList>
-                            {folderBookmarks.length === 0 ? (
-                              <EmptyFolderText>
-                                이 폴더에 즐겨찾기가 없습니다.
-                              </EmptyFolderText>
-                            ) : (
-                              folderBookmarks.map((bm) => {
-                                const displayLabel = getBookmarkDisplayLabel(
-                                  bm.label,
-                                  indexMap[bm.key]
-                                );
-
-                                return (
-                                  <BookmarkItem key={bm.key}>
-                                    {/* 1줄: 제목 + 페이지 */}
-                                    <BookmarkHeader>
-                                      {editingKey === bm.key ? (
-                                        <BookmarkLabelInput
-                                          autoFocus
-                                          value={editingLabel}
-                                          onChange={(e) =>
-                                            setEditingLabel(e.target.value)
-                                          }
-                                          onKeyDown={(e) => {
-                                            if (e.key === "Enter") {
-                                              saveEditBookmark(bm.key);
-                                            }
-                                            if (e.key === "Escape") {
-                                              cancelEditBookmark();
-                                            }
-                                          }}
-                                        />
-                                      ) : (
-                                        <BookmarkLabelButton
-                                          onClick={() => goToBookmark(bm)}
-                                        >
-                                          📘 {displayLabel}
-                                        </BookmarkLabelButton>
-                                      )}
-
-                                      <BookmarkPageText>
-                                        {bm.page}p
-                                      </BookmarkPageText>
-                                    </BookmarkHeader>
-
-                                    {/* 2줄: 수정/삭제 버튼 + 폴더 선택 */}
-                                    <BookmarkMiddleRow>
-                                      <BookmarkActions>
-                                        {editingKey === bm.key ? (
-                                          <>
-                                            <ChangeButton
-                                              onClick={() =>
-                                                saveEditBookmark(bm.key)
-                                              }
-                                            >
-                                              저장
-                                            </ChangeButton>
-                                            <CancelButton
-                                              onClick={cancelEditBookmark}
-                                            >
-                                              취소
-                                            </CancelButton>
-                                            <RemoveButton
-                                              onClick={() =>
-                                                removeBookmark(bm.key)
-                                              }
-                                            >
-                                              삭제
-                                            </RemoveButton>
-                                          </>
-                                        ) : (
-                                          <>
-                                            <ChangeButton
-                                              onClick={() =>
-                                                startEditBookmark(
-                                                  bm,
-                                                  displayLabel
-                                                )
-                                              }
-                                            >
-                                              수정
-                                            </ChangeButton>
-                                            <RemoveButton
-                                              onClick={() =>
-                                                removeBookmark(bm.key)
-                                              }
-                                            >
-                                              삭제
-                                            </RemoveButton>
-                                          </>
-                                        )}
-                                      </BookmarkActions>
-
-                                      <FolderSelect
-                                        value={bm.folderId || ""}
-                                        onChange={(e) =>
-                                          handleChangeBookmarkFolder(
-                                            bm.key,
-                                            e.target.value
-                                          )
-                                        }
-                                      >
-                                        <option value="">(폴더 없음)</option>
-                                        {fileFolders.map((f) => (
-                                          <option key={f.id} value={f.id}>
-                                            {f.name}
-                                          </option>
-                                        ))}
-                                      </FolderSelect>
-                                    </BookmarkMiddleRow>
-
-                                    {/* 3줄: 생성 날짜 */}
-                                    <BookmarkDateRow>{bm.date}</BookmarkDateRow>
-                                  </BookmarkItem>
-                                );
-                              })
-                            )}
-                          </FolderBookmarkList>
-                        )}
-                      </FolderWrapper>
-                    );
-                  })}
-
-                  {/* 2) 폴더에 속하지 않은 즐겨찾기들 (항상 아래에 출력) */}
-                  {bookmarksWithoutFolder.map((bm) => {
-                    const displayLabel = getBookmarkDisplayLabel(
-                      bm.label,
-                      indexMap[bm.key]
-                    );
-
-                    return (
-                      <BookmarkItem key={bm.key}>
-                        {/* 1줄: 제목 + 페이지 */}
-                        <BookmarkHeader>
-                          {editingKey === bm.key ? (
-                            <BookmarkLabelInput
-                              autoFocus
-                              value={editingLabel}
-                              onChange={(e) => setEditingLabel(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") {
-                                  saveEditBookmark(bm.key);
-                                }
-                                if (e.key === "Escape") {
-                                  cancelEditBookmark();
-                                }
-                              }}
-                            />
-                          ) : (
-                            <BookmarkLabelButton
-                              onClick={() => goToBookmark(bm)}
-                            >
-                              📘 {displayLabel}
-                            </BookmarkLabelButton>
-                          )}
-
-                          <BookmarkPageText>{bm.page}p</BookmarkPageText>
-                        </BookmarkHeader>
-
-                        {/* 2줄: 수정/삭제 버튼 + 폴더 선택 */}
-                        <BookmarkMiddleRow>
-                          <BookmarkActions>
-                            {editingKey === bm.key ? (
-                              <>
-                                <ChangeButton
-                                  onClick={() => saveEditBookmark(bm.key)}
-                                >
-                                  저장
-                                </ChangeButton>
-                                <CancelButton onClick={cancelEditBookmark}>
-                                  취소
-                                </CancelButton>
-                                <RemoveButton
-                                  onClick={() => removeBookmark(bm.key)}
-                                >
-                                  삭제
-                                </RemoveButton>
-                              </>
-                            ) : (
-                              <>
-                                <ChangeButton
-                                  onClick={() =>
-                                    startEditBookmark(bm, displayLabel)
-                                  }
-                                >
-                                  수정
-                                </ChangeButton>
-                                <RemoveButton
-                                  onClick={() => removeBookmark(bm.key)}
-                                >
-                                  삭제
-                                </RemoveButton>
-                              </>
-                            )}
-                          </BookmarkActions>
-
-                          <FolderSelect
-                            value={bm.folderId || ""}
+                        {editingFolderId === folder.id ? (
+                          <BookmarkLabelInput
+                            autoFocus
+                            value={editingFolderName}
                             onChange={(e) =>
-                              handleChangeBookmarkFolder(bm.key, e.target.value)
+                              setEditingFolderName(e.target.value)
                             }
-                          >
-                            <option value="">(폴더 없음)</option>
-                            {fileFolders.map((folder) => (
-                              <option key={folder.id} value={folder.id}>
-                                {folder.name}
-                              </option>
-                            ))}
-                          </FolderSelect>
-                        </BookmarkMiddleRow>
+                            onKeyDown={(e) => {
+                              if (e.nativeEvent.isComposing) return;
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                saveEditFolder(folder.id);
+                              }
+                              if (e.key === "Escape") {
+                                e.preventDefault();
+                                cancelEditFolder();
+                              }
+                            }}
+                          />
+                        ) : (
+                          <FolderName onClick={() => startEditFolder(folder)}>
+                            {folder.name}
+                          </FolderName>
+                        )}
+                      </div>
 
-                        {/* 3줄: 생성 날짜 */}
-                        <BookmarkDateRow>{bm.date}</BookmarkDateRow>
-                      </BookmarkItem>
-                    );
-                  })}
-                </BookmarkList>
-              )}
-            </FileGroup>
-          );
-        })}
-      </RightSidebar>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 4,
+                          fontSize: 10,
+                          color: "#999",
+                        }}
+                      >
+                        <span>{folderBookmarks.length}개</span>
+
+                        {editingFolderId === folder.id && (
+                          <>
+                            <button
+                              style={{
+                                fontSize: 11,
+                                border: "none",
+                                background: "none",
+                                color: "blue",
+                                cursor: "pointer",
+                              }}
+                              onClick={() => saveEditFolder(folder.id)}
+                            >
+                              저장
+                            </button>
+                            <button
+                              style={{
+                                fontSize: 11,
+                                border: "none",
+                                background: "none",
+                                color: "#555",
+                                cursor: "pointer",
+                              }}
+                              onClick={cancelEditFolder}
+                            >
+                              취소
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </FolderTitleRow>
+
+                    {!isFolderCollapsed && (
+                      <FolderBookmarkList>
+                        {folderBookmarks.length === 0 ? (
+                          <EmptyFolderText>
+                            이 폴더에 즐겨찾기가 없습니다.
+                          </EmptyFolderText>
+                        ) : (
+                          folderBookmarks.map((bm) => {
+                            const displayLabel = getBookmarkDisplayLabel(
+                              bm.label,
+                              indexMap[bm.key]
+                            );
+
+                            return (
+                              <BookmarkItem
+                                key={bm.key}
+                                onContextMenu={(e) =>
+                                  handleBookmarkContextMenu(e, bm)
+                                }
+                              >
+                                <BookmarkHeader>
+                                  {editingKey === bm.key ? (
+                                    <BookmarkLabelInput
+                                      autoFocus
+                                      value={editingLabel}
+                                      onChange={(e) =>
+                                        setEditingLabel(e.target.value)
+                                      }
+                                      onKeyDown={(e) => {
+                                        if (e.nativeEvent.isComposing) return;
+
+                                        if (e.key === "Enter") {
+                                          e.preventDefault();
+                                          saveEditBookmark(bm.key);
+                                        }
+                                        if (e.key === "Escape") {
+                                          e.preventDefault();
+                                          cancelEditBookmark();
+                                        }
+                                      }}
+                                    />
+                                  ) : (
+                                    <BookmarkLabelButton
+                                      onClick={() => goToBookmark(bm)}
+                                    >
+                                      📘 {displayLabel}
+                                    </BookmarkLabelButton>
+                                  )}
+
+                                  <BookmarkPageText>
+                                    {bm.fileName} · {bm.page}p
+                                  </BookmarkPageText>
+                                </BookmarkHeader>
+
+                                <BookmarkMiddleRow />
+                              </BookmarkItem>
+                            );
+                          })
+                        )}
+                      </FolderBookmarkList>
+                    )}
+                  </FolderWrapper>
+                );
+              })}
+            </FolderList>
+
+            {/* 폴더에 속하지 않은 즐겨찾기 */}
+            <h4 style={{ margin: "8px 0 4px" }}>📌 폴더 없음</h4>
+            {unassignedBookmarks.length === 0 ? (
+              <EmptyText>폴더에 속하지 않은 즐겨찾기가 없습니다.</EmptyText>
+            ) : (
+              <FolderBookmarkList>
+                {unassignedBookmarks.map((bm) => {
+                  const displayLabel = getBookmarkDisplayLabel(
+                    bm.label,
+                    indexMap[bm.key]
+                  );
+                  return (
+                    <BookmarkItem
+                      key={bm.key}
+                      onContextMenu={(e) => handleBookmarkContextMenu(e, bm)}
+                    >
+                      <BookmarkHeader>
+                        {editingKey === bm.key ? (
+                          <BookmarkLabelInput
+                            autoFocus
+                            value={editingLabel}
+                            onChange={(e) => setEditingLabel(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.nativeEvent.isComposing) return;
+
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                saveEditBookmark(bm.key);
+                              }
+                              if (e.key === "Escape") {
+                                e.preventDefault();
+                                cancelEditBookmark();
+                              }
+                            }}
+                          />
+                        ) : (
+                          <BookmarkLabelButton onClick={() => goToBookmark(bm)}>
+                            📘 {displayLabel}
+                          </BookmarkLabelButton>
+                        )}
+
+                        <BookmarkPageText>
+                          {bm.fileName} · {bm.page}p
+                        </BookmarkPageText>
+                      </BookmarkHeader>
+
+                      <BookmarkMiddleRow />
+                    </BookmarkItem>
+                  );
+                })}
+              </FolderBookmarkList>
+            )}
+          </RightSidebar>
+        </>
+      )}
+
+      {/* 컨텍스트 메뉴 렌더링 */}
+      {contextMenu.visible && contextMenu.type === "folder" && (
+        <ContextMenu
+          $x={contextMenu.x}
+          $y={contextMenu.y}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <ContextMenuItem onClick={handleFolderRenameFromMenu}>
+            이름 변경
+          </ContextMenuItem>
+          <ContextMenuItem onClick={handleFolderDeleteFromMenu}>
+            삭제
+          </ContextMenuItem>
+        </ContextMenu>
+      )}
+
+      {contextMenu.visible && contextMenu.type === "bookmark" && (
+        <ContextMenu
+          $x={contextMenu.x}
+          $y={contextMenu.y}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <ContextMenuItem onClick={handleBookmarkFolderChangeFromMenu}>
+            폴더 변경
+          </ContextMenuItem>
+          <ContextMenuItem onClick={handleBookmarkRenameFromMenu}>
+            이름 수정
+          </ContextMenuItem>
+          <ContextMenuItem onClick={handleBookmarkDeleteFromMenu}>
+            삭제
+          </ContextMenuItem>
+        </ContextMenu>
+      )}
+
+      {/* 폴더 선택 모달 */}
+      {folderDialog.visible && (
+        <DialogOverlay onClick={closeFolderDialog}>
+          <Dialog onClick={(e) => e.stopPropagation()}>
+            <DialogTitle>폴더 선택</DialogTitle>
+            <DialogSelect
+              value={folderDialog.value}
+              onChange={(e) =>
+                setFolderDialog((prev) => ({
+                  ...prev,
+                  value: e.target.value,
+                }))
+              }
+            >
+              <option value="">(폴더 없음)</option>
+              {folders.map((folder) => (
+                <option key={folder.id} value={folder.id}>
+                  {folder.name}
+                </option>
+              ))}
+            </DialogSelect>
+            <DialogActions>
+              <DialogButton onClick={confirmFolderDialog}>확인</DialogButton>
+              <DialogButton onClick={closeFolderDialog}>취소</DialogButton>
+            </DialogActions>
+          </Dialog>
+        </DialogOverlay>
+      )}
     </Container>
   );
 }
