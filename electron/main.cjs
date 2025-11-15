@@ -1,5 +1,5 @@
 // main.cjs
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu } = require("electron"); // 👈 Menu 추가
 const path = require("path");
 const fs = require("fs");
 
@@ -23,12 +23,17 @@ function createWindow() {
     width: 1200,
     height: 800,
     icon: path.join(__dirname, "..", "assets", "mandarinPDF3.ico"),
+    autoHideMenuBar: true, // 👈 창 메뉴바 자동 숨김
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       nodeIntegration: true, // renderer에서 require('electron') 사용 가능
       contextIsolation: false, // window.electronAPI 안 써도 됨
     },
   });
+
+  // 혹시 모를 경우를 위해 한 번 더 확실하게 숨기기
+  mainWindow.setMenuBarVisibility(false);
+  // mainWindow.removeMenu(); // 이 줄을 써도 되고, 위 한 줄만 있어도 대부분 충분합니다.
 
   if (isDev) {
     // ✅ 개발 모드: Vite dev 서버
@@ -47,6 +52,9 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // 🔹 전역 앱 메뉴 제거 (macOS 상단 메뉴 포함)
+  Menu.setApplicationMenu(null); // 👈 이 줄이 상단 메뉴 전체를 없애줌
+
   // 👉 두 번째 인스턴스로 실행하려고 할 때 (이미 앱이 켜져 있는 상태에서 다른 pdf 더블클릭)
   app.on("second-instance", (event, commandLine, workingDirectory) => {
     const newPdfPath = extractPdfFromArgv(commandLine);

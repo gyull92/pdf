@@ -31,11 +31,22 @@ const Container = styled.div`
 const Sidebar = styled.div`
   width: 185px;
   border-right: 1px solid #ccc;
-  padding: 10px;
+  padding: 0 10px 10px 10px;
   box-sizing: border-box;
   overflow-y: auto;
   overflow-x: auto;
   flex-shrink: 0;
+  background: #fff;
+`;
+
+// 🔹 사이드바 헤더(좌측) - 항상 상단에 고정
+const SidebarHeader = styled.div`
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: #fff;
+  padding: 8px 0 12px;
+  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.04);
 `;
 
 // 🔹 썸네일 컨테이너: gap 2px
@@ -81,6 +92,68 @@ const RightCollapsedTab = styled.div`
 
   &:hover {
     background: #e4e4e4;
+  }
+`;
+
+// 중앙 영역 (탭바 + 본문)
+const Center = styled.div`
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+`;
+
+// 상단 탭 바 (크롬 탭 느낌)
+const TabBar = styled.div`
+  display: flex;
+  align-items: flex-end;
+  height: 32px;
+  padding: 0 6px;
+  background: #f5f5f5;
+  border-bottom: 1px solid #ddd;
+  flex-shrink: 0;
+  overflow-x: auto;
+`;
+
+// 개별 탭
+const Tab = styled.div`
+  display: flex;
+  align-items: center;
+  max-width: 180px;
+  padding: 4px 8px;
+  margin-right: 4px;
+  border-radius: 6px 6px 0 0;
+  border: 1px solid #ccc;
+  border-bottom: ${(props) =>
+    props.$active ? "1px solid #ffffff" : "1px solid #ccc"};
+  background: ${(props) => (props.$active ? "#ffffff" : "#e6e6e6")};
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: ${(props) => (props.$dragging ? 0.6 : 1)};
+`;
+
+const TabTitle = styled.span`
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+`;
+
+const TabCloseButton = styled.button`
+  border: none;
+  background: transparent;
+  padding: 0 4px;
+  margin-left: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+
+  &:hover {
+    background: rgba(0, 0, 0, 0.08);
+    border-radius: 50%;
   }
 `;
 
@@ -168,7 +241,6 @@ const PageThumbnail = styled.div`
   padding: 2px;
   box-sizing: border-box;
 
-  /* gap(2px)을 고려해서 2개가 딱 맞게 들어가도록 계산 */
   flex: 0 0
     ${(props) => (props.$scale ? `calc(${props.$scale * 100}% - 1px)` : "100%")};
 
@@ -206,6 +278,17 @@ const RightSidebar = styled.div`
   padding: 10px;
   overflow-y: auto;
   flex-shrink: 0;
+  background: #fff;
+`;
+
+// 🔹 우측 사이드바 헤더(즐겨찾기) - 항상 상단 고정
+const RightSidebarHeader = styled.div`
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: #fff;
+  padding-bottom: 4px;
+  margin-bottom: 8px;
 `;
 
 const EmptyText = styled.p`
@@ -509,7 +592,15 @@ export default function PdfViewerWithBookmarks() {
 
   const [bookmarks, setBookmarks] = useState([]);
   const [fileName, setFileName] = useState("");
+  const [filePath, setFilePath] = useState(""); // 🔹 현재 PDF 파일 경로
   const [thumbnails, setThumbnails] = useState([]);
+
+  // 여러 PDF 탭
+  const [tabs, setTabs] = useState([]);
+  const [activeTabId, setActiveTabId] = useState(null);
+
+  // 🔹 드래그 중인 탭 id
+  const [draggingTabId, setDraggingTabId] = useState(null);
 
   // 페이지 텍스트 (텍스트 검색용)
   const [pageTexts, setPageTexts] = useState([]);
@@ -587,6 +678,7 @@ export default function PdfViewerWithBookmarks() {
     value: "",
   });
 
+  // 🔹 전역 드래그 방지 (브라우저 기본 동작 막기)
   useEffect(() => {
     const preventDefault = (e) => {
       e.preventDefault();
@@ -630,6 +722,47 @@ export default function PdfViewerWithBookmarks() {
   useEffect(() => {
     setPageInput(String(currentPage));
   }, [currentPage]);
+
+  // 🔹 현재 활성 탭에 상태를 저장 (탭 전환 시 상태 유지용)
+  useEffect(() => {
+    if (!activeTabId) return;
+
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === activeTabId
+          ? {
+              ...tab,
+              fileName,
+              filePath, // 🔹 경로도 함께 저장
+              pdf,
+              totalPages,
+              currentPage,
+              pageInput,
+              scale,
+              thumbnails,
+              pageTexts,
+              searchQuery,
+              searchMatches,
+              searchIndex,
+            }
+          : tab
+      )
+    );
+  }, [
+    activeTabId,
+    fileName,
+    filePath,
+    pdf,
+    totalPages,
+    currentPage,
+    pageInput,
+    scale,
+    thumbnails,
+    pageTexts,
+    searchQuery,
+    searchMatches,
+    searchIndex,
+  ]);
 
   // Ctrl+Z 되돌리기
   useEffect(() => {
@@ -719,7 +852,6 @@ export default function PdfViewerWithBookmarks() {
   const handleSidebarWheel = (e) => {
     if (!e.ctrlKey) return;
 
-    // 🔵 브라우저가 허용하는 경우에만 preventDefault 호출
     if (e.cancelable) {
       e.preventDefault();
     }
@@ -906,43 +1038,97 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // PDF 로딩 핵심 로직 (buffer + 파일명 기반)
-  const loadPdfFromArrayBuffer = async (arrayBuffer, name) => {
+  // PDF 로딩 핵심 로직 (buffer + 파일명 기반, 여러 탭 + 경로 지원)
+  const loadPdfFromArrayBuffer = async (
+    arrayBuffer,
+    name,
+    sourcePath = null,
+    initialPage = 1
+  ) => {
     if (!arrayBuffer) return;
-
-    setFileName(name);
 
     const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
-    pdfCacheRef.current[name] = pdfDoc;
+    // 🔹 캐시 키: 경로가 있으면 경로, 없으면 파일명
+    const cacheKey = sourcePath || name;
+    pdfCacheRef.current[cacheKey] = pdfDoc;
+
+    const total = pdfDoc.numPages;
+    const thumbnailsInit = new Array(total).fill(null);
+
+    // 같은 이름 탭이 있으면 재사용, 없으면 새 탭 생성
+    const existingTab = tabs.find((t) => t.fileName === name);
+    let targetTabId;
+
+    if (existingTab) {
+      targetTabId = existingTab.id;
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === existingTab.id
+            ? {
+                ...t,
+                pdf: pdfDoc,
+                fileName: name,
+                filePath: sourcePath || t.filePath || null,
+                totalPages: total,
+                currentPage: initialPage,
+                pageInput: String(initialPage),
+                scale: INITIAL_SCALE,
+                thumbnails: thumbnailsInit,
+                pageTexts: [],
+                searchQuery: "",
+                searchMatches: [],
+                searchIndex: 0,
+              }
+            : t
+        )
+      );
+    } else {
+      targetTabId = `tab-${Date.now()}-${Math.random()}`;
+      const newTab = {
+        id: targetTabId,
+        fileName: name,
+        filePath: sourcePath,
+        pdf: pdfDoc,
+        totalPages: total,
+        currentPage: initialPage,
+        pageInput: String(initialPage),
+        scale: INITIAL_SCALE,
+        thumbnails: thumbnailsInit,
+        pageTexts: [],
+        searchQuery: "",
+        searchMatches: [],
+        searchIndex: 0,
+      };
+      setTabs((prev) => [...prev, newTab]);
+    }
+
+    setActiveTabId(targetTabId);
+    setFileName(name);
+    setFilePath(sourcePath || "");
+    setPdf(pdfDoc);
+    setTotalPages(total);
+    setCurrentPage(initialPage);
+    setPageInput(String(initialPage));
+    setScale(INITIAL_SCALE);
+    setThumbnails(thumbnailsInit);
+    setPageTexts([]);
+    setSearchQuery("");
+    setSearchMatches([]);
+    setSearchIndex(0);
 
     const newGeneration = thumbnailGenerationRef.current + 1;
     thumbnailGenerationRef.current = newGeneration;
-
-    setThumbnails(new Array(pdfDoc.numPages).fill(null));
-
-    setPdf(pdfDoc);
-    setTotalPages(pdfDoc.numPages);
-    setCurrentPage(1);
-    setScale(INITIAL_SCALE);
-
-    // 검색 관련 상태 리셋
-    setPageTexts([]);
-    setSearchMatches([]);
-    setSearchIndex(0);
-    setSearchQuery("");
-
     generateThumbnails(pdfDoc, newGeneration);
   };
 
   // OS에서 넘어온 파일 경로로 PDF 열기
-  const loadPdfFromPath = async (filePath) => {
-    if (!ipcRenderer || !filePath) return;
+  const loadPdfFromPath = async (path, initialPage = 1) => {
+    if (!ipcRenderer || !path) return;
 
     try {
-      const buffer = await ipcRenderer.invoke("read-pdf-file", filePath);
+      const buffer = await ipcRenderer.invoke("read-pdf-file", path);
 
-      // Buffer 또는 Uint8Array → "정확한 범위"의 ArrayBuffer 변환
       const uint8 =
         buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
 
@@ -951,8 +1137,8 @@ export default function PdfViewerWithBookmarks() {
         uint8.byteOffset + uint8.byteLength
       );
 
-      const name = filePath.split(/[/\\]/).pop() || "PDF";
-      await loadPdfFromArrayBuffer(arrayBuffer, name);
+      const name = path.split(/[/\\]/).pop() || "PDF";
+      await loadPdfFromArrayBuffer(arrayBuffer, name, path, initialPage);
     } catch (err) {
       console.error("loadPdfFromPath 실패:", err);
     }
@@ -963,7 +1149,110 @@ export default function PdfViewerWithBookmarks() {
     if (!file) return;
 
     const arrayBuffer = await file.arrayBuffer();
-    await loadPdfFromArrayBuffer(arrayBuffer, file.name);
+    const sourcePath = file.path || null; // 🔹 Electron에서 실제 경로
+    await loadPdfFromArrayBuffer(arrayBuffer, file.name, sourcePath, 1);
+  };
+
+  // 탭 선택
+  const handleSelectTab = (tabId) => {
+    const tab = tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+
+    setActiveTabId(tabId);
+    setFileName(tab.fileName || "");
+    setFilePath(tab.filePath || "");
+    setPdf(tab.pdf || null);
+    setTotalPages(tab.totalPages || 0);
+    setCurrentPage(tab.currentPage || 1);
+    setPageInput(tab.pageInput || String(tab.currentPage || 1));
+    setScale(tab.scale || INITIAL_SCALE);
+    setThumbnails(
+      tab.thumbnails ||
+        (tab.totalPages ? new Array(tab.totalPages).fill(null) : [])
+    );
+    setPageTexts(tab.pageTexts || []);
+    setSearchQuery(tab.searchQuery || "");
+    setSearchMatches(tab.searchMatches || []);
+    setSearchIndex(tab.searchIndex || 0);
+
+    if (tab.pdf) {
+      const newGeneration = thumbnailGenerationRef.current + 1;
+      thumbnailGenerationRef.current = newGeneration;
+
+      if (!tab.thumbnails || tab.thumbnails.every((t) => !t)) {
+        setThumbnails(new Array(tab.pdf.numPages).fill(null));
+        generateThumbnails(tab.pdf, newGeneration);
+      }
+    }
+  };
+
+  // 탭 닫기
+  const handleCloseTab = (tabId) => {
+    setTabs((prev) => {
+      const idx = prev.findIndex((t) => t.id === tabId);
+      if (idx === -1) return prev;
+
+      const newTabs = [...prev];
+      newTabs.splice(idx, 1);
+
+      const closingActive = tabId === activeTabId;
+
+      if (closingActive) {
+        const newActive = newTabs[idx] || newTabs[idx - 1] || null;
+
+        if (newActive) {
+          setActiveTabId(newActive.id);
+          setFileName(newActive.fileName || "");
+          setFilePath(newActive.filePath || "");
+          setPdf(newActive.pdf || null);
+          setTotalPages(newActive.totalPages || 0);
+          setCurrentPage(newActive.currentPage || 1);
+          setPageInput(
+            newActive.pageInput || String(newActive.currentPage || 1)
+          );
+          setScale(newActive.scale || INITIAL_SCALE);
+          setThumbnails(
+            newActive.thumbnails ||
+              (newActive.totalPages
+                ? new Array(newActive.totalPages).fill(null)
+                : [])
+          );
+          setPageTexts(newActive.pageTexts || []);
+          setSearchQuery(newActive.searchQuery || "");
+          setSearchMatches(newActive.searchMatches || []);
+          setSearchIndex(newActive.searchIndex || 0);
+
+          if (newActive.pdf) {
+            const newGeneration = thumbnailGenerationRef.current + 1;
+            thumbnailGenerationRef.current = newGeneration;
+            if (
+              !newActive.thumbnails ||
+              newActive.thumbnails.every((t) => !t)
+            ) {
+              setThumbnails(new Array(newActive.pdf.numPages).fill(null));
+              generateThumbnails(newActive.pdf, newGeneration);
+            }
+          }
+        } else {
+          // 모든 탭이 닫힌 경우 상태 초기화
+          setActiveTabId(null);
+          setFileName("");
+          setFilePath("");
+          setPdf(null);
+          setTotalPages(0);
+          setCurrentPage(1);
+          setPageInput("1");
+          setScale(INITIAL_SCALE);
+          setThumbnails([]);
+          setPageTexts([]);
+          setSearchQuery("");
+          setSearchMatches([]);
+          setSearchIndex(0);
+        }
+      }
+
+      return newTabs;
+    });
   };
 
   // 파일 열기
@@ -1058,9 +1347,9 @@ export default function PdfViewerWithBookmarks() {
 
     const openInitialPdf = async () => {
       try {
-        const filePath = await ipcRenderer.invoke("get-initial-pdf-path");
-        if (filePath) {
-          await loadPdfFromPath(filePath);
+        const path = await ipcRenderer.invoke("get-initial-pdf-path");
+        if (path) {
+          await loadPdfFromPath(path, 1);
         }
       } catch (err) {
         console.error("초기 PDF 로드 실패:", err);
@@ -1074,9 +1363,9 @@ export default function PdfViewerWithBookmarks() {
   useEffect(() => {
     if (!ipcRenderer) return;
 
-    const handler = (event, filePath) => {
-      if (filePath) {
-        loadPdfFromPath(filePath);
+    const handler = (event, path) => {
+      if (path) {
+        loadPdfFromPath(path, 1);
       }
     };
 
@@ -1131,6 +1420,7 @@ export default function PdfViewerWithBookmarks() {
       const newBookmark = {
         key,
         fileName,
+        filePath: filePath || null, // 🔹 경로도 함께 저장
         page: pageNum,
         date: new Date().toLocaleString(),
         label: "",
@@ -1187,7 +1477,6 @@ export default function PdfViewerWithBookmarks() {
   const handleWheel = (e) => {
     if (!e.ctrlKey) return;
 
-    // 🔵 여기서도 동일하게 체크
     if (e.cancelable) {
       e.preventDefault();
     }
@@ -1205,7 +1494,8 @@ export default function PdfViewerWithBookmarks() {
   useEffect(() => {
     if (!sidebarRef.current) return;
     const container = sidebarRef.current;
-    const thumb = thumbnailRefs.current[currentPage - 1];
+    const idx = currentPage - 1;
+    const thumb = thumbnailRefs.current[idx];
     if (!thumb) return;
 
     const containerRect = container.getBoundingClientRect();
@@ -1236,35 +1526,87 @@ export default function PdfViewerWithBookmarks() {
   };
 
   const goToBookmark = async (bm) => {
-    if (fileName === bm.fileName && pdf) {
-      jumpToPage(bm.page);
+    // 1) 이미 열린 탭인지 확인 (경로 우선)
+    const targetTab = tabs.find((t) =>
+      bm.filePath ? t.filePath === bm.filePath : t.fileName === bm.fileName
+    );
+    if (targetTab) {
+      handleSelectTab(targetTab.id);
+      setTimeout(() => {
+        jumpToPage(bm.page);
+      }, 200);
       return;
     }
 
-    const cachedDoc = pdfCacheRef.current[bm.fileName];
-    if (!cachedDoc) {
-      alert(
-        `이 북마크의 PDF("${bm.fileName}")는 현재 메모리에 없습니다.\n먼저 해당 파일을 한 번 열어주세요.`
-      );
+    // 2) 메모리 캐시에 있으면 그걸로 새 탭 열기
+    const cacheKey = bm.filePath || bm.fileName;
+    const cachedDoc = pdfCacheRef.current[cacheKey];
+    if (cachedDoc) {
+      const total = cachedDoc.numPages;
+      const thumbnailsInit = new Array(total).fill(null);
+      const tabId = `tab-${Date.now()}-${Math.random()}`;
+
+      const newTab = {
+        id: tabId,
+        fileName: bm.fileName,
+        filePath: bm.filePath || null,
+        pdf: cachedDoc,
+        totalPages: total,
+        currentPage: bm.page,
+        pageInput: String(bm.page),
+        scale: INITIAL_SCALE,
+        thumbnails: thumbnailsInit,
+        pageTexts: [],
+        searchQuery: "",
+        searchMatches: [],
+        searchIndex: 0,
+      };
+
+      setTabs((prev) => [...prev, newTab]);
+
+      setActiveTabId(tabId);
+      setFileName(bm.fileName);
+      setFilePath(bm.filePath || "");
+      setPdf(cachedDoc);
+      setTotalPages(total);
+      setCurrentPage(bm.page);
+      setPageInput(String(bm.page));
+      setScale(INITIAL_SCALE);
+      setThumbnails(thumbnailsInit);
+      setPageTexts([]);
+      setSearchQuery("");
+      setSearchMatches([]);
+      setSearchIndex(0);
+
+      const newGeneration = thumbnailGenerationRef.current + 1;
+      thumbnailGenerationRef.current = newGeneration;
+      generateThumbnails(cachedDoc, newGeneration);
+
+      setTimeout(() => {
+        scrollToPage(bm.page);
+      }, 200);
       return;
     }
 
-    const newGeneration = thumbnailGenerationRef.current + 1;
-    thumbnailGenerationRef.current = newGeneration;
+    // 3) 캐시에 없지만 파일 경로가 있으면, 그 경로로 다시 읽어오기
+    if (bm.filePath && ipcRenderer) {
+      try {
+        await loadPdfFromPath(bm.filePath, bm.page);
+        setTimeout(() => {
+          scrollToPage(bm.page);
+        }, 200);
+      } catch (e) {
+        alert(
+          `PDF 파일을 다시 여는 데 실패했습니다.\n경로: ${bm.filePath}\n파일이 옮겨졌는지 / 삭제되지 않았는지 확인해주세요.`
+        );
+      }
+      return;
+    }
 
-    setThumbnails(new Array(cachedDoc.numPages).fill(null));
-
-    setPdf(cachedDoc);
-    setFileName(bm.fileName);
-    setTotalPages(cachedDoc.numPages);
-    setScale(INITIAL_SCALE);
-    setCurrentPage(bm.page);
-
-    generateThumbnails(cachedDoc, newGeneration);
-
-    setTimeout(() => {
-      scrollToPage(bm.page);
-    }, 200);
+    // 4) 최후 fallback (옛날 북마크 등)
+    alert(
+      `이 북마크의 PDF("${bm.fileName}") 정보를 찾을 수 없습니다.\n파일을 직접 다시 열어주세요.`
+    );
   };
 
   // 폴더 관련
@@ -1558,7 +1900,7 @@ export default function PdfViewerWithBookmarks() {
       setSearchMatches([]);
       setSearchIndex(0);
     }
-  }, [searchQuery, searchMatches.length]);
+  }, [searchQuery, searchMatches.length, pdf, totalPages]);
 
   const gotoMatch = (nextIndex) => {
     if (searchMatches.length === 0) return;
@@ -1644,6 +1986,38 @@ export default function PdfViewerWithBookmarks() {
     closeContextMenu();
   };
 
+  // 탭 드래그 시작
+  const handleTabDragStart = (e, tabId) => {
+    setDraggingTabId(tabId);
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", tabId);
+    }
+  };
+
+  // 탭 위로 드래그 중일 때 (순서 재배치)
+  const handleTabDragOver = (e, targetTabId) => {
+    e.preventDefault();
+    if (!draggingTabId || draggingTabId === targetTabId) return;
+
+    setTabs((prev) => {
+      const fromIndex = prev.findIndex((t) => t.id === draggingTabId);
+      const toIndex = prev.findIndex((t) => t.id === targetTabId);
+      if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex)
+        return prev;
+
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  };
+
+  // 드래그 끝
+  const handleTabDragEnd = () => {
+    setDraggingTabId(null);
+  };
+
   const closeFolderDialog = () => {
     setFolderDialog({
       visible: false,
@@ -1664,12 +2038,10 @@ export default function PdfViewerWithBookmarks() {
   // 🔵 왼쪽 페이지 목록에서 보여줄 페이지 목록 계산 (즐겨찾기 필터 적용)
   const getThumbnailPages = () => {
     if (!pdf || totalPages === 0) return [];
-    // 기본: 모든 페이지
     let pages = Array.from({ length: totalPages }, (_, i) => i + 1);
 
     if (!showOnlyBookmarked || !fileName) return pages;
 
-    // 현재 파일에서 북마크된 페이지만 필터링
     const bookmarkedPages = bookmarks
       .filter((b) => b.fileName === fileName)
       .map((b) => b.page);
@@ -1677,7 +2049,6 @@ export default function PdfViewerWithBookmarks() {
     const pageSet = new Set(bookmarkedPages);
     const filtered = pages.filter((p) => pageSet.has(p));
 
-    // 오름차순 정렬
     filtered.sort((a, b) => a - b);
     return filtered;
   };
@@ -1703,59 +2074,62 @@ export default function PdfViewerWithBookmarks() {
         </LeftCollapsedTab>
       ) : (
         <Sidebar ref={sidebarRef} onWheel={handleSidebarWheel}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              marginBottom: 8,
-            }}
-          >
+          <SidebarHeader>
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 4,
+                justifyContent: "space-between",
               }}
             >
-              <h3 style={{ margin: 0 }}>페이지</h3>
-              {/* 🔵 즐겨찾기 토글 버튼 (onSvg / offSvg) */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                }}
+              >
+                <h3 style={{ margin: 0 }}>페이지</h3>
+                {/* 🔵 즐겨찾기 토글 버튼 (onSvg / offSvg) */}
+                <button
+                  type="button"
+                  onClick={handleToggleShowOnlyBookmarked}
+                  style={{
+                    border: "none",
+                    background: "none",
+                    cursor: "pointer",
+                    padding: 0,
+                  }}
+                  title={
+                    showOnlyBookmarked ? "모든 페이지 보기" : "즐겨찾기만 보기"
+                  }
+                >
+                  <img
+                    src={showOnlyBookmarked ? onSvg : offSvg}
+                    alt={
+                      showOnlyBookmarked
+                        ? "즐겨찾기만 보기"
+                        : "전체 페이지 보기"
+                    }
+                    style={{ width: 20, height: 20 }}
+                  />
+                </button>
+              </div>
+
               <button
                 type="button"
-                onClick={handleToggleShowOnlyBookmarked}
                 style={{
                   border: "none",
                   background: "none",
                   cursor: "pointer",
-                  padding: 0,
+                  fontSize: 12,
                 }}
-                title={
-                  showOnlyBookmarked ? "모든 페이지 보기" : "즐겨찾기만 보기"
-                }
+                onClick={() => setIsLeftCollapsed(true)}
               >
-                <img
-                  src={showOnlyBookmarked ? onSvg : offSvg}
-                  alt={
-                    showOnlyBookmarked ? "즐겨찾기만 보기" : "전체 페이지 보기"
-                  }
-                  style={{ width: 20, height: 20 }}
-                />
+                접기
               </button>
             </div>
-
-            <button
-              type="button"
-              style={{
-                border: "none",
-                background: "none",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-              onClick={() => setIsLeftCollapsed(true)}
-            >
-              접기
-            </button>
-          </div>
+          </SidebarHeader>
 
           <ThumbnailsContainer>
             {getThumbnailPages().map((pageNum) => {
@@ -1767,7 +2141,6 @@ export default function PdfViewerWithBookmarks() {
                 <PageThumbnail
                   key={pageNum}
                   ref={(el) => {
-                    // 항상 할당해서 언마운트 시 null 들어오도록
                     thumbnailRefs.current[idx] = el;
                   }}
                   $active={currentPage === pageNum}
@@ -1813,235 +2186,264 @@ export default function PdfViewerWithBookmarks() {
         </Sidebar>
       )}
 
-      {/* 중앙 본문 */}
-      <Main
-        ref={mainRef}
-        onScroll={handleScroll}
-        onWheel={handleWheel}
-        $highlight={isHighlightMode || isEraseMode}
-      >
-        <Toolbar ref={toolbarRef}>
-          <input type="file" accept="application/pdf" onChange={handleFile} />
-          {pdf && (
-            <>
-              <button
-                onClick={() => {
-                  if (currentPage > 1) {
-                    jumpToPage(currentPage - 1);
-                  }
+      {/* 중앙 영역: 상단 탭바 + PDF 본문 */}
+      <Center>
+        <TabBar>
+          {tabs.map((tab) => (
+            <Tab
+              key={tab.id}
+              $active={tab.id === activeTabId}
+              $dragging={draggingTabId === tab.id}
+              onClick={() => handleSelectTab(tab.id)}
+              draggable
+              onDragStart={(e) => handleTabDragStart(e, tab.id)}
+              onDragOver={(e) => handleTabDragOver(e, tab.id)}
+              onDragEnd={handleTabDragEnd}
+            >
+              <TabTitle>{tab.fileName}</TabTitle>
+              <TabCloseButton
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleCloseTab(tab.id);
                 }}
               >
-                ◀ 이전
-              </button>
+                ✕
+              </TabCloseButton>
+            </Tab>
+          ))}
+        </TabBar>
 
-              <PageNumberInput
-                type="number"
-                min={1}
-                max={totalPages || 1}
-                value={pageInput}
-                onChange={(e) => setPageInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    const num = Number(pageInput);
-                    if (!Number.isNaN(num)) {
-                      jumpToPage(num);
+        {/* 중앙 본문 */}
+        <Main
+          ref={mainRef}
+          onScroll={handleScroll}
+          onWheel={handleWheel}
+          $highlight={isHighlightMode || isEraseMode}
+        >
+          <Toolbar ref={toolbarRef}>
+            <input type="file" accept="application/pdf" onChange={handleFile} />
+            {pdf && (
+              <>
+                <button
+                  onClick={() => {
+                    if (currentPage > 1) {
+                      jumpToPage(currentPage - 1);
                     }
-                  }
-                }}
-              />
-              <span>/ {totalPages}</span>
+                  }}
+                >
+                  ◀ 이전
+                </button>
 
-              <button
-                onClick={() => {
-                  if (currentPage < totalPages) {
-                    jumpToPage(currentPage + 1);
-                  }
-                }}
-              >
-                다음 ▶
-              </button>
-
-              {/* 형광펜 토글 */}
-              <button
-                type="button"
-                onClick={() =>
-                  setIsHighlightMode((prev) => {
-                    const next = !prev;
-                    if (next) setIsEraseMode(false);
-                    return next;
-                  })
-                }
-                style={{
-                  padding: "4px 8px",
-                  fontSize: "12px",
-                  borderRadius: "4px",
-                  border: "1px solid #ccc",
-                  background: isHighlightMode ? "#fff7c2" : "#f8f8f8",
-                  cursor: "pointer",
-                }}
-              >
-                🖍 형광펜 {isHighlightMode ? "ON" : "OFF"}
-              </button>
-
-              {/* 지우개 토글 */}
-              <button
-                type="button"
-                onClick={() =>
-                  setIsEraseMode((prev) => {
-                    const next = !prev;
-                    if (next) setIsHighlightMode(false);
-                    return next;
-                  })
-                }
-                style={{
-                  padding: "4px 8px",
-                  fontSize: "12px",
-                  borderRadius: "4px",
-                  border: "1px solid #ccc",
-                  background: isEraseMode ? "#ffe4e4" : "#f8f8f8",
-                  cursor: "pointer",
-                }}
-              >
-                🧽 지우개 {isEraseMode ? "ON" : "OFF"}
-              </button>
-
-              {/* 텍스트 검색 영역 */}
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 4,
-                  marginLeft: 8,
-                }}
-              >
-                <input
-                  type="text"
-                  placeholder="텍스트 검색"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
+                <PageNumberInput
+                  type="number"
+                  min={1}
+                  max={totalPages || 1}
+                  value={pageInput}
+                  onChange={(e) => setPageInput(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") {
-                      if (!hasSearchResults) {
-                        handleSearch();
-                      } else {
-                        gotoMatch(searchIndex + 1);
+                      const num = Number(pageInput);
+                      if (!Number.isNaN(num)) {
+                        jumpToPage(num);
                       }
                     }
                   }}
-                  style={{
-                    fontSize: 12,
-                    padding: "2px 4px",
-                    borderRadius: 4,
-                    border: "1px solid #ccc",
-                    minWidth: 140,
-                  }}
                 />
+                <span>/ {totalPages}</span>
+
+                <button
+                  onClick={() => {
+                    if (currentPage < totalPages) {
+                      jumpToPage(currentPage + 1);
+                    }
+                  }}
+                >
+                  다음 ▶
+                </button>
+
+                {/* 형광펜 토글 */}
                 <button
                   type="button"
-                  onClick={handleSearch}
+                  onClick={() =>
+                    setIsHighlightMode((prev) => {
+                      const next = !prev;
+                      if (next) setIsEraseMode(false);
+                      return next;
+                    })
+                  }
                   style={{
-                    fontSize: 12,
-                    padding: "2px 6px",
-                    borderRadius: 4,
+                    padding: "4px 8px",
+                    fontSize: "12px",
+                    borderRadius: "4px",
                     border: "1px solid #ccc",
-                    background: "#f8f8f8",
+                    background: isHighlightMode ? "#fff7c2" : "#f8f8f8",
                     cursor: "pointer",
                   }}
                 >
-                  검색
+                  🖍 형광펜 {isHighlightMode ? "ON" : "OFF"}
                 </button>
-                <span
-                  style={{
-                    fontSize: 11,
-                    color: "#666",
-                    minWidth: 60,
-                    textAlign: "center",
-                  }}
-                >
-                  {hasSearchResults
-                    ? `${searchIndex + 1} / ${searchMatches.length}`
-                    : ""}
-                </span>
+
+                {/* 지우개 토글 */}
                 <button
                   type="button"
-                  disabled={!hasSearchResults}
-                  onClick={() => gotoMatch(searchIndex - 1)}
+                  onClick={() =>
+                    setIsEraseMode((prev) => {
+                      const next = !prev;
+                      if (next) setIsHighlightMode(false);
+                      return next;
+                    })
+                  }
                   style={{
-                    fontSize: 12,
-                    padding: "2px 4px",
-                    borderRadius: 4,
+                    padding: "4px 8px",
+                    fontSize: "12px",
+                    borderRadius: "4px",
                     border: "1px solid #ccc",
-                    background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
-                    cursor: hasSearchResults ? "pointer" : "default",
+                    background: isEraseMode ? "#ffe4e4" : "#f8f8f8",
+                    cursor: "pointer",
                   }}
                 >
-                  ◀
+                  🧽 지우개 {isEraseMode ? "ON" : "OFF"}
                 </button>
-                <button
-                  type="button"
-                  disabled={!hasSearchResults}
-                  onClick={() => gotoMatch(searchIndex + 1)}
+
+                {/* 텍스트 검색 영역 */}
+                <div
                   style={{
-                    fontSize: 12,
-                    padding: "2px 4px",
-                    borderRadius: 4,
-                    border: "1px solid #ccc",
-                    background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
-                    cursor: hasSearchResults ? "pointer" : "default",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    marginLeft: 8,
                   }}
                 >
-                  ▶
-                </button>
-              </div>
-
-              {/* 본문 줌 컨트롤 */}
-              <ZoomToolbar>
-                <ZoomButton type="button" onClick={handleZoomOut}>
-                  -
-                </ZoomButton>
-                <ZoomValue>{Math.round(scale * 100)}%</ZoomValue>
-                <ZoomButton type="button" onClick={handleZoomIn}>
-                  +
-                </ZoomButton>
-                <ZoomResetButton type="button" onClick={handleResetZoom}>
-                  100%
-                </ZoomResetButton>
-              </ZoomToolbar>
-            </>
-          )}
-        </Toolbar>
-
-        <PagesWrapper>
-          {pdf &&
-            Array.from({ length: totalPages }, (_, i) => {
-              const pageNum = i + 1;
-              return (
-                <PageContainer key={i}>
-                  <Canvas
-                    ref={(el) => {
-                      if (el) canvasRefs.current[i] = el;
+                  <input
+                    type="text"
+                    placeholder="텍스트 검색"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        if (!hasSearchResults) {
+                          handleSearch();
+                        } else {
+                          gotoMatch(searchIndex + 1);
+                        }
+                      }
                     }}
-                    onMouseDown={handleCanvasMouseDown(pageNum)}
-                    $highlight={isHighlightMode || isEraseMode}
-                  />
-                  {/* 텍스트 레이어 */}
-                  <div
-                    ref={(el) => {
-                      if (el) textLayerRefs.current[i] = el;
-                    }}
-                    className="textLayer"
                     style={{
-                      position: "absolute",
-                      left: 0,
-                      top: 0,
-                      pointerEvents: "none",
+                      fontSize: 12,
+                      padding: "2px 4px",
+                      borderRadius: 4,
+                      border: "1px solid #ccc",
+                      minWidth: 140,
                     }}
                   />
-                </PageContainer>
-              );
-            })}
-        </PagesWrapper>
-      </Main>
+                  <button
+                    type="button"
+                    onClick={handleSearch}
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 6px",
+                      borderRadius: 4,
+                      border: "1px solid #ccc",
+                      background: "#f8f8f8",
+                      cursor: "pointer",
+                    }}
+                  >
+                    검색
+                  </button>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      color: "#666",
+                      minWidth: 60,
+                      textAlign: "center",
+                    }}
+                  >
+                    {hasSearchResults
+                      ? `${searchIndex + 1} / ${searchMatches.length}`
+                      : ""}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={!hasSearchResults}
+                    onClick={() => gotoMatch(searchIndex - 1)}
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 4px",
+                      borderRadius: 4,
+                      border: "1px solid #ccc",
+                      background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
+                      cursor: hasSearchResults ? "pointer" : "default",
+                    }}
+                  >
+                    ◀
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!hasSearchResults}
+                    onClick={() => gotoMatch(searchIndex + 1)}
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 4px",
+                      borderRadius: 4,
+                      border: "1px solid #ccc",
+                      background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
+                      cursor: hasSearchResults ? "pointer" : "default",
+                    }}
+                  >
+                    ▶
+                  </button>
+                </div>
+
+                {/* 본문 줌 컨트롤 */}
+                <ZoomToolbar>
+                  <ZoomButton type="button" onClick={handleZoomOut}>
+                    -
+                  </ZoomButton>
+                  <ZoomValue>{Math.round(scale * 100)}%</ZoomValue>
+                  <ZoomButton type="button" onClick={handleZoomIn}>
+                    +
+                  </ZoomButton>
+                  <ZoomResetButton type="button" onClick={handleResetZoom}>
+                    100%
+                  </ZoomResetButton>
+                </ZoomToolbar>
+              </>
+            )}
+          </Toolbar>
+
+          <PagesWrapper>
+            {pdf &&
+              Array.from({ length: totalPages }, (_, i) => {
+                const pageNum = i + 1;
+                return (
+                  <PageContainer key={i}>
+                    <Canvas
+                      ref={(el) => {
+                        if (el) canvasRefs.current[i] = el;
+                      }}
+                      onMouseDown={handleCanvasMouseDown(pageNum)}
+                      $highlight={isHighlightMode || isEraseMode}
+                    />
+                    {/* 텍스트 레이어 */}
+                    <div
+                      ref={(el) => {
+                        if (el) textLayerRefs.current[i] = el;
+                      }}
+                      className="textLayer"
+                      style={{
+                        position: "absolute",
+                        left: 0,
+                        top: 0,
+                        pointerEvents: "none",
+                      }}
+                    />
+                  </PageContainer>
+                );
+              })}
+          </PagesWrapper>
+        </Main>
+      </Center>
 
       {/* 오른쪽 즐겨찾기 탭 */}
       {isRightCollapsed ? (
@@ -2053,28 +2455,29 @@ export default function PdfViewerWithBookmarks() {
           <RightResizeHandle onMouseDown={handleRightResizeMouseDown} />
 
           <RightSidebar $width={rightSidebarWidth}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                marginBottom: 8,
-              }}
-            >
-              <h3 style={{ margin: 0 }}>📑 즐겨찾기</h3>
-              <button
-                type="button"
+            <RightSidebarHeader>
+              <div
                 style={{
-                  border: "none",
-                  background: "none",
-                  cursor: "pointer",
-                  fontSize: 12,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
                 }}
-                onClick={() => setIsRightCollapsed(true)}
               >
-                접기
-              </button>
-            </div>
+                <h3 style={{ margin: 0 }}>📑 즐겨찾기</h3>
+                <button
+                  type="button"
+                  style={{
+                    border: "none",
+                    background: "none",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                  onClick={() => setIsRightCollapsed(true)}
+                >
+                  접기
+                </button>
+              </div>
+            </RightSidebarHeader>
 
             <AddFolderButton type="button" onClick={handleAddFolder}>
               + 폴더 추가
