@@ -1,6 +1,6 @@
 {
   "name": "gyul-pdf-viewer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "즐겨찾기 기능이 포함된 윈도우용 PDF 뷰어",
   "type": "module",
   "main": "electron/main.cjs",
@@ -21,11 +21,11 @@
       "!node_modules/canvas/**"
     ],
     "directories": {
-      "buildResources": "assets"
+      "buildResources": "src/assets"
     },
     "win": {
       "target": "nsis",
-      "icon": "assets/icon.ico"
+      "icon": "mandarinPDF3.ico"
     },
     "publish": null,
     "mac": null
