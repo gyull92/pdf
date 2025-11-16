@@ -2,9 +2,9 @@ import { useState, useEffect, useRef } from "react";
 import styled from "styled-components";
 import * as pdfjsLib from "pdfjs-dist";
 import "pdfjs-dist/web/pdf_viewer.css";
-import PageSidebar from "./components/SidePage"; // 왼쪽 페이지 사이드바
-import BookmarkSidebar from "./components/BookMarkPage"; // 오른쪽 즐겨찾기 사이드바
-import PdfToolbar from "./components/ToolBar"; // ✅ 새로 만든 상단 툴바 컴포넌트
+import PageSidebar from "./components/SidePage";
+import BookmarkSidebar from "./components/BookMarkPage";
+import PdfToolbar from "./components/ToolBar";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
@@ -51,7 +51,7 @@ const TabBar = styled.div`
 const Tab = styled.div`
   display: flex;
   align-items: center;
-  max-width: 180px;
+  width: 100px;
   padding: 4px 8px;
   margin-right: 4px;
   border-radius: 6px 6px 0 0;
@@ -116,6 +116,15 @@ const PageContainer = styled.div`
 const Canvas = styled.canvas`
   box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
   cursor: ${(props) => (props.$highlight ? "crosshair" : "default")};
+`;
+
+// ✅ 형광펜 전용 캔버스 (PDF 위에 얹는 레이어)
+const HighlightCanvas = styled.canvas`
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  z-index: 1;
 `;
 
 // 줌 상수
@@ -215,6 +224,7 @@ export default function PdfViewerWithBookmarks() {
 
   const canvasRefs = useRef([]);
   const textLayerRefs = useRef([]);
+  const highlightCanvasRefs = useRef([]); // ✅ 형광펜 캔버스 ref
   const mainRef = useRef(null);
   const toolbarRef = useRef(null);
   const scrollTickingRef = useRef(false);
@@ -231,7 +241,7 @@ export default function PdfViewerWithBookmarks() {
   // 썸네일 렌더 세대 관리
   const thumbnailGenerationRef = useRef(0);
 
-  // 전역 드래그앤드롭 처리 (브라우저 기본 동작 막기 + PDF 열기)
+  // 전역 드래그앤드롭 처리 (브라우저 기본 동작 막기 + 드래그 상태만 관리)
   useEffect(() => {
     const isFileDrag = (e) => {
       const dt = e.dataTransfer;
@@ -258,20 +268,6 @@ export default function PdfViewerWithBookmarks() {
       if (!isFileDrag(e)) return;
       e.preventDefault();
       setIsDragOver(false);
-
-      const file = e.dataTransfer?.files?.[0];
-      if (!file) return;
-
-      const isPdf =
-        file.type === "application/pdf" ||
-        file.name.toLowerCase().endsWith(".pdf");
-
-      if (!isPdf) {
-        alert("PDF 파일만 열 수 있습니다.");
-        return;
-      }
-
-      loadPdfFromFile(file);
     };
 
     window.addEventListener("dragover", handleWindowDragOver);
@@ -375,32 +371,6 @@ export default function PdfViewerWithBookmarks() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [fileName]);
 
-  // 형광펜 영역 그리기
-  const drawHighlightsForPage = (pageNum) => {
-    if (!pdf) return;
-    const canvas = canvasRefs.current[pageNum - 1];
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const pageHighlights = highlights.filter(
-      (h) => h.fileName === fileName && h.page === pageNum
-    );
-    if (pageHighlights.length === 0) return;
-
-    ctx.save();
-    pageHighlights.forEach((h) => {
-      const x = h.x * canvas.width;
-      const y = h.y * canvas.height;
-      const w = h.width * canvas.width;
-      const hgt = h.height * canvas.height;
-      ctx.fillStyle = h.color || DEFAULT_HIGHLIGHT_COLOR;
-      ctx.fillRect(x, y, w, hgt);
-    });
-    ctx.restore();
-  };
-
   // 검색된 텍스트 하이라이트
   const applySearchHighlightForPage = (pageNum) => {
     const q = searchQuery.trim();
@@ -445,11 +415,13 @@ export default function PdfViewerWithBookmarks() {
     });
   };
 
-  // 한 페이지 렌더
+  // 한 페이지 렌더 (PDF + 텍스트레이어, 형광펜 캔버스 사이즈만 맞춤)
   const renderPage = async (num, scaleValue = scale) => {
     if (!pdf) return;
     const canvas = canvasRefs.current[num - 1];
     const textLayerDiv = textLayerRefs.current[num - 1];
+    const highlightCanvas = highlightCanvasRefs.current[num - 1];
+
     if (!canvas || !textLayerDiv) return;
 
     const page = await pdf.getPage(num);
@@ -464,11 +436,16 @@ export default function PdfViewerWithBookmarks() {
     await page.render({ canvasContext: ctx, viewport }).promise;
     await renderTextLayerOnPage(page, viewport, textLayerDiv);
 
-    drawHighlightsForPage(num);
+    // 형광펜 캔버스도 크기 맞추기
+    if (highlightCanvas) {
+      highlightCanvas.width = canvas.width;
+      highlightCanvas.height = canvas.height;
+    }
+
     applySearchHighlightForPage(num);
   };
 
-  // 전체 페이지 렌더
+  // 전체 페이지 렌더 (PDF만 다시 그림) — 형광펜 때문에 재렌더하지 않도록 highlights는 빼기
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
 
@@ -494,7 +471,45 @@ export default function PdfViewerWithBookmarks() {
     return () => {
       cancelled = true;
     };
-  }, [pdf, totalPages, scale, highlights, searchMatches]);
+  }, [pdf, totalPages, scale, searchMatches]);
+
+  // ✅ 형광펜만 별도 캔버스에 다시 그리기
+  useEffect(() => {
+    if (!pdf || totalPages === 0) return;
+
+    for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+      const baseCanvas = canvasRefs.current[pageNum - 1];
+      const highlightCanvas = highlightCanvasRefs.current[pageNum - 1];
+      if (!baseCanvas || !highlightCanvas) continue;
+
+      const ctx = highlightCanvas.getContext("2d");
+      if (!ctx) continue;
+
+      // PDF 캔버스 크기에 맞춰주기 (사이즈 변경 시 자동 clear)
+      if (
+        highlightCanvas.width !== baseCanvas.width ||
+        highlightCanvas.height !== baseCanvas.height
+      ) {
+        highlightCanvas.width = baseCanvas.width;
+        highlightCanvas.height = baseCanvas.height;
+      } else {
+        ctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+      }
+
+      const pageHighlights = highlights.filter(
+        (h) => h.fileName === fileName && h.page === pageNum
+      );
+
+      pageHighlights.forEach((h) => {
+        const x = h.x * highlightCanvas.width;
+        const y = h.y * highlightCanvas.height;
+        const w = h.width * highlightCanvas.width;
+        const hgt = h.height * highlightCanvas.height;
+        ctx.fillStyle = h.color || DEFAULT_HIGHLIGHT_COLOR;
+        ctx.fillRect(x, y, w, hgt);
+      });
+    }
+  }, [highlights, pdf, totalPages, scale, fileName]);
 
   // 썸네일 생성
   const generateThumbnails = async (pdfDoc, generation) => {
@@ -561,14 +576,22 @@ export default function PdfViewerWithBookmarks() {
     const total = pdfDoc.numPages;
     const thumbnailsInit = new Array(total).fill(null);
 
-    const existingTab = tabs.find((t) => t.fileName === name);
-    let targetTabId;
+    // ❗ 탭 생성/업데이트는 항상 prev 기반으로 처리
+    let resolvedTabId = null;
 
-    if (existingTab) {
-      targetTabId = existingTab.id;
-      setTabs((prev) =>
-        prev.map((t) =>
-          t.id === existingTab.id
+    setTabs((prev) => {
+      // 1) 경로 기준으로 먼저 찾고, 없으면 이름으로 찾기
+      const byPath =
+        sourcePath != null ? prev.find((t) => t.filePath === sourcePath) : null;
+      const byName = prev.find((t) => t.fileName === name);
+
+      const existing = byPath || byName;
+
+      if (existing) {
+        // 이미 있는 탭이면 그 탭만 업데이트
+        resolvedTabId = existing.id;
+        return prev.map((t) =>
+          t.id === existing.id
             ? {
                 ...t,
                 pdf: pdfDoc,
@@ -585,12 +608,15 @@ export default function PdfViewerWithBookmarks() {
                 searchIndex: 0,
               }
             : t
-        )
-      );
-    } else {
-      targetTabId = `tab-${Date.now()}-${Math.random()}`;
+        );
+      }
+
+      // 새 탭 생성
+      const newId = `tab-${Date.now()}-${Math.random()}`;
+      resolvedTabId = newId;
+
       const newTab = {
-        id: targetTabId,
+        id: newId,
         fileName: name,
         filePath: sourcePath,
         pdf: pdfDoc,
@@ -604,10 +630,13 @@ export default function PdfViewerWithBookmarks() {
         searchMatches: [],
         searchIndex: 0,
       };
-      setTabs((prev) => [...prev, newTab]);
-    }
 
-    setActiveTabId(targetTabId);
+      return [...prev, newTab];
+    });
+
+    if (!resolvedTabId) return;
+
+    setActiveTabId(resolvedTabId);
     setFileName(name);
     setFilePath(sourcePath || "");
     setPdf(pdfDoc);
@@ -626,7 +655,6 @@ export default function PdfViewerWithBookmarks() {
     generateThumbnails(pdfDoc, newGeneration);
   };
 
-  // OS에서 넘어온 파일 경로로 PDF 열기
   const loadPdfFromPath = async (path, initialPage = 1) => {
     if (!ipcRenderer || !path) return;
 
@@ -1522,6 +1550,12 @@ export default function PdfViewerWithBookmarks() {
                       onMouseDown={handleCanvasMouseDown(pageNum)}
                       $highlight={isHighlightMode || isEraseMode}
                     />
+                    {/* ✅ 형광펜 캔버스 */}
+                    <HighlightCanvas
+                      ref={(el) => {
+                        if (el) highlightCanvasRefs.current[i] = el;
+                      }}
+                    />
                     {/* 텍스트 레이어 */}
                     <div
                       ref={(el) => {
@@ -1533,6 +1567,7 @@ export default function PdfViewerWithBookmarks() {
                         left: 0,
                         top: 0,
                         pointerEvents: "none",
+                        zIndex: 2, // 텍스트가 형광펜 위에 오도록
                       }}
                     />
                   </PageContainer>
