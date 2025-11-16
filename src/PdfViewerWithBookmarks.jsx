@@ -7,7 +7,6 @@ import onSvg from "../src/svg/on.svg";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
-// 맨 위 import들 아래쯤
 let ipcRenderer = null;
 
 if (typeof window !== "undefined" && window.require) {
@@ -301,8 +300,10 @@ const BookmarkItem = styled.li`
   flex-direction: column;
   margin-bottom: 6px;
   border-bottom: 1px solid #eee;
-  padding: 4px 0;
+  padding: 4px 4px;
   gap: 4px;
+  border-radius: 4px;
+  background: ${(props) => (props.$selected ? "#e6f0ff" : "transparent")};
 `;
 
 const BookmarkHeader = styled.div`
@@ -667,7 +668,7 @@ export default function PdfViewerWithBookmarks() {
     visible: false,
     x: 0,
     y: 0,
-    type: null, // 'folder' | 'bookmark'
+    type: null, // 'folder' | 'bookmark' | 'unassigned'
     target: null, // { folderId } or { key }
   });
 
@@ -678,18 +679,65 @@ export default function PdfViewerWithBookmarks() {
     value: "",
   });
 
-  // 🔹 전역 드래그 방지 (브라우저 기본 동작 막기)
+  // 🔵 즐겨찾기 다중 선택 / 드래그 상태
+  const [selectedBookmarkKeys, setSelectedBookmarkKeys] = useState([]);
+  const [lastSelectedBookmarkKey, setLastSelectedBookmarkKey] = useState(null);
+  const [draggingBookmarkKeys, setDraggingBookmarkKeys] = useState([]);
+
+  // 🔹 전역 드래그앤드롭 처리 (브라우저 기본 동작 막기 + PDF 열기)
   useEffect(() => {
-    const preventDefault = (e) => {
-      e.preventDefault();
+    const isFileDrag = (e) => {
+      const dt = e.dataTransfer;
+      if (!dt) return false;
+      // Files 타입이 있을 때만 "파일 드래그"로 간주
+      return Array.from(dt.types || []).includes("Files");
     };
 
-    window.addEventListener("dragover", preventDefault);
-    window.addEventListener("drop", preventDefault);
+    const handleWindowDragOver = (e) => {
+      if (!isFileDrag(e)) return; // 🔹 내부 드래그(즐겨찾기 이동)는 건드리지 않음
+
+      e.preventDefault();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = "copy";
+      }
+      setIsDragOver(true);
+    };
+
+    const handleWindowDragLeave = (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      setIsDragOver(false);
+    };
+
+    const handleWindowDrop = (e) => {
+      if (!isFileDrag(e)) return; // 🔹 파일이 아닐 때는 그냥 패스
+
+      e.preventDefault();
+      setIsDragOver(false);
+
+      const file = e.dataTransfer?.files?.[0];
+      if (!file) return;
+
+      const isPdf =
+        file.type === "application/pdf" ||
+        file.name.toLowerCase().endsWith(".pdf");
+
+      if (!isPdf) {
+        alert("PDF 파일만 열 수 있습니다.");
+        return;
+      }
+
+      loadPdfFromFile(file);
+    };
+
+    window.addEventListener("dragover", handleWindowDragOver);
+    window.addEventListener("dragleave", handleWindowDragLeave);
+    window.addEventListener("drop", handleWindowDrop);
 
     return () => {
-      window.removeEventListener("dragover", preventDefault);
-      window.removeEventListener("drop", preventDefault);
+      window.removeEventListener("dragover", handleWindowDragOver);
+      window.removeEventListener("dragleave", handleWindowDragLeave);
+      window.removeEventListener("drop", handleWindowDrop);
     };
   }, []);
 
@@ -1857,6 +1905,8 @@ export default function PdfViewerWithBookmarks() {
   });
 
   const unassignedBookmarks = bookmarks.filter((bm) => !bm.folderId);
+  // 🔹 '폴더 없음' 리스트에 보이는 즐겨찾기 key 순서
+  const unassignedKeys = unassignedBookmarks.map((b) => b.key);
 
   // 텍스트 검색
   const handleSearch = () => {
@@ -1929,12 +1979,32 @@ export default function PdfViewerWithBookmarks() {
   const handleBookmarkContextMenu = (e, bm) => {
     e.preventDefault();
     e.stopPropagation();
+
+    // 우클릭 시, 선택에 포함되지 않았다면 이 북마크만 선택
+    if (!selectedBookmarkKeys.includes(bm.key)) {
+      setSelectedBookmarkKeys([bm.key]);
+      setLastSelectedBookmarkKey(bm.key);
+    }
+
     setContextMenu({
       visible: true,
       x: e.clientX,
       y: e.clientY,
       type: "bookmark",
       target: { key: bm.key },
+    });
+  };
+
+  // 🔹 '폴더 없음' 영역 우클릭
+  const handleUnassignedContextMenu = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({
+      visible: true,
+      x: e.clientX,
+      y: e.clientY,
+      type: "unassigned",
+      target: null,
     });
   };
 
@@ -1983,6 +2053,59 @@ export default function PdfViewerWithBookmarks() {
   const handleBookmarkDeleteFromMenu = () => {
     if (!contextMenu.target) return;
     removeBookmark(contextMenu.target.key);
+    closeContextMenu();
+  };
+
+  // 🔹 특정 폴더 안 즐겨찾기 모두 삭제
+  const handleDeleteAllBookmarksInFolder = (folderId) => {
+    const folder = folders.find((f) => f.id === folderId);
+    const name = folder ? folder.name : "";
+    const count = bookmarks.filter((bm) => bm.folderId === folderId).length;
+
+    if (count === 0) {
+      alert("이 폴더에는 삭제할 즐겨찾기가 없습니다.");
+      return;
+    }
+
+    if (
+      !window.confirm(
+        `"${name}" 폴더 안의 ${count}개 즐겨찾기를 모두 삭제하시겠습니까?`
+      )
+    ) {
+      return;
+    }
+
+    setBookmarks((prev) => prev.filter((bm) => bm.folderId !== folderId));
+  };
+
+  // 🔹 '폴더 없음' 즐겨찾기 모두 삭제
+  const handleDeleteAllUnassignedBookmarks = () => {
+    const count = bookmarks.filter((bm) => !bm.folderId).length;
+
+    if (count === 0) {
+      alert("'폴더 없음'에 삭제할 즐겨찾기가 없습니다.");
+      return;
+    }
+
+    if (
+      !window.confirm(
+        `'폴더 없음'에 있는 ${count}개의 즐겨찾기를 모두 삭제하시겠습니까?`
+      )
+    ) {
+      return;
+    }
+
+    setBookmarks((prev) => prev.filter((bm) => bm.folderId));
+  };
+
+  const handleFolderDeleteAllBookmarksFromMenu = () => {
+    if (!contextMenu.target) return;
+    handleDeleteAllBookmarksInFolder(contextMenu.target.folderId);
+    closeContextMenu();
+  };
+
+  const handleUnassignedDeleteAllFromMenu = () => {
+    handleDeleteAllUnassignedBookmarks();
     closeContextMenu();
   };
 
@@ -2058,15 +2181,132 @@ export default function PdfViewerWithBookmarks() {
     setShowOnlyBookmarked((prev) => !prev);
   };
 
+  // 🔵 즐겨찾기 클릭(단일/다중/범위 선택)
+  // visibleKeys: 현재 클릭한 즐겨찾기가 속한 리스트(폴더 / 폴더 없음)의 key 순서
+  const handleBookmarkClick = (e, bm, visibleKeys) => {
+    e.stopPropagation();
+
+    const allKeysInOrder =
+      Array.isArray(visibleKeys) && visibleKeys.length > 0
+        ? visibleKeys
+        : bookmarks.map((b) => b.key);
+
+    // Shift 범위 선택: 현재 리스트 안에서만 동작
+    if (e.shiftKey && lastSelectedBookmarkKey) {
+      const lastIndex = allKeysInOrder.indexOf(lastSelectedBookmarkKey);
+      const currentIndex = allKeysInOrder.indexOf(bm.key);
+
+      if (lastIndex !== -1 && currentIndex !== -1) {
+        const [start, end] =
+          lastIndex < currentIndex
+            ? [lastIndex, currentIndex]
+            : [currentIndex, lastIndex];
+
+        const rangeKeys = allKeysInOrder.slice(start, end + 1);
+
+        setSelectedBookmarkKeys((prev) =>
+          Array.from(new Set([...prev, ...rangeKeys]))
+        );
+        return;
+      }
+    }
+
+    // Ctrl / Cmd 다중 선택
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedBookmarkKeys((prev) =>
+        prev.includes(bm.key)
+          ? prev.filter((k) => k !== bm.key)
+          : [...prev, bm.key]
+      );
+      setLastSelectedBookmarkKey(bm.key);
+      return;
+    }
+
+    // 일반 클릭: 단일 선택
+    setSelectedBookmarkKeys([bm.key]);
+    setLastSelectedBookmarkKey(bm.key);
+  };
+
+  // 🔵 즐겨찾기 드래그 시작/끝
+  const handleBookmarkDragStart = (e, bm) => {
+    let keysToDrag = selectedBookmarkKeys.includes(bm.key)
+      ? selectedBookmarkKeys
+      : [bm.key];
+
+    if (!selectedBookmarkKeys.includes(bm.key)) {
+      setSelectedBookmarkKeys(keysToDrag);
+      setLastSelectedBookmarkKey(bm.key);
+    }
+
+    setDraggingBookmarkKeys(keysToDrag);
+
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", JSON.stringify(keysToDrag));
+    }
+  };
+
+  const handleBookmarkDragEnd = () => {
+    setDraggingBookmarkKeys([]);
+  };
+
+  // 🔵 폴더로 드롭했을 때 즐겨찾기 이동
+  const handleBookmarkDropOnFolder = (e, folderId) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    let keys = draggingBookmarkKeys;
+
+    if ((!keys || keys.length === 0) && e.dataTransfer) {
+      const data = e.dataTransfer.getData("text/plain");
+      if (data) {
+        try {
+          keys = JSON.parse(data);
+        } catch (err) {
+          keys = [];
+        }
+      }
+    }
+
+    if (!keys || keys.length === 0) return;
+
+    setBookmarks((prev) =>
+      prev.map((bm) => (keys.includes(bm.key) ? { ...bm, folderId } : bm))
+    );
+
+    setDraggingBookmarkKeys([]);
+  };
+
+  // 🔵 '폴더 없음'으로 드롭했을 때 폴더 해제
+  const handleBookmarkDropOnUnassigned = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    let keys = draggingBookmarkKeys;
+
+    if ((!keys || keys.length === 0) && e.dataTransfer) {
+      const data = e.dataTransfer.getData("text/plain");
+      if (data) {
+        try {
+          keys = JSON.parse(data);
+        } catch (err) {
+          keys = [];
+        }
+      }
+    }
+
+    if (!keys || keys.length === 0) return;
+
+    setBookmarks((prev) =>
+      prev.map((bm) => (keys.includes(bm.key) ? { ...bm, folderId: null } : bm))
+    );
+
+    setDraggingBookmarkKeys([]);
+  };
+
   // 렌더링
   return (
-    <Container
-      $dragOver={isDragOver}
-      onDragEnter={handleDragEnter}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-    >
+    <Container $dragOver={isDragOver}>
       {/* 왼쪽 페이지 탭 (접힘/펼침) */}
       {isLeftCollapsed ? (
         <LeftCollapsedTab onClick={() => setIsLeftCollapsed(false)}>
@@ -2493,11 +2733,20 @@ export default function PdfViewerWithBookmarks() {
                   (bm) => bm.folderId === folder.id
                 );
                 const isFolderCollapsed = collapsedFolders[folder.id];
+                // 🔹 이 폴더 안에서의 key 순서
+                const folderBookmarkKeys = folderBookmarks.map((b) => b.key);
 
                 return (
                   <FolderWrapper
                     key={folder.id}
                     onContextMenu={(e) => handleFolderContextMenu(e, folder)}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      if (e.dataTransfer) {
+                        e.dataTransfer.dropEffect = "move";
+                      }
+                    }}
+                    onDrop={(e) => handleBookmarkDropOnFolder(e, folder.id)}
                   >
                     <FolderTitleRow>
                       <div
@@ -2596,10 +2845,22 @@ export default function PdfViewerWithBookmarks() {
                               bm.label,
                               indexMap[bm.key]
                             );
+                            const selected = selectedBookmarkKeys.includes(
+                              bm.key
+                            );
 
                             return (
                               <BookmarkItem
                                 key={bm.key}
+                                $selected={selected}
+                                draggable
+                                onClick={(e) =>
+                                  handleBookmarkClick(e, bm, folderBookmarkKeys)
+                                }
+                                onDragStart={(e) =>
+                                  handleBookmarkDragStart(e, bm)
+                                }
+                                onDragEnd={handleBookmarkDragEnd}
                                 onContextMenu={(e) =>
                                   handleBookmarkContextMenu(e, bm)
                                 }
@@ -2650,19 +2911,47 @@ export default function PdfViewerWithBookmarks() {
               })}
             </FolderList>
 
-            {/* 폴더에 속하지 않은 즐겨찾기 */}
-            {unassignedBookmarks.length > 0 && (
-              <>
-                <h4 style={{ margin: "8px 0 4px" }}>📌 폴더 없음</h4>
-                <FolderBookmarkList>
-                  {unassignedBookmarks.map((bm) => {
+            {/* 폴더에 속하지 않은 즐겨찾기 (항상 드롭 가능 영역) */}
+            <div
+              onContextMenu={handleUnassignedContextMenu}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (e.dataTransfer) {
+                  e.dataTransfer.dropEffect = "move";
+                }
+              }}
+              onDrop={handleBookmarkDropOnUnassigned}
+              style={{
+                marginTop: 8,
+                paddingBottom: 8,
+              }}
+            >
+              <h4 style={{ margin: "0 0 4px", cursor: "default" }}>
+                📌 폴더 없음
+              </h4>
+
+              <FolderBookmarkList>
+                {unassignedBookmarks.length === 0 ? (
+                  <EmptyFolderText>
+                    이 영역에 드롭하면 ‘폴더 없음’으로 이동합니다.
+                  </EmptyFolderText>
+                ) : (
+                  unassignedBookmarks.map((bm) => {
                     const displayLabel = getBookmarkDisplayLabel(
                       bm.label,
                       indexMap[bm.key]
                     );
+                    const selected = selectedBookmarkKeys.includes(bm.key);
                     return (
                       <BookmarkItem
                         key={bm.key}
+                        $selected={selected}
+                        draggable
+                        onClick={(e) =>
+                          handleBookmarkClick(e, bm, unassignedKeys)
+                        }
+                        onDragStart={(e) => handleBookmarkDragStart(e, bm)}
+                        onDragEnd={handleBookmarkDragEnd}
                         onContextMenu={(e) => handleBookmarkContextMenu(e, bm)}
                       >
                         <BookmarkHeader>
@@ -2700,10 +2989,10 @@ export default function PdfViewerWithBookmarks() {
                         <BookmarkMiddleRow />
                       </BookmarkItem>
                     );
-                  })}
-                </FolderBookmarkList>
-              </>
-            )}
+                  })
+                )}
+              </FolderBookmarkList>
+            </div>
           </RightSidebar>
         </>
       )}
@@ -2719,7 +3008,10 @@ export default function PdfViewerWithBookmarks() {
             이름 변경
           </ContextMenuItem>
           <ContextMenuItem onClick={handleFolderDeleteFromMenu}>
-            삭제
+            폴더 삭제
+          </ContextMenuItem>
+          <ContextMenuItem onClick={handleFolderDeleteAllBookmarksFromMenu}>
+            폴더 내 즐겨찾기 모두 삭제
           </ContextMenuItem>
         </ContextMenu>
       )}
@@ -2738,6 +3030,19 @@ export default function PdfViewerWithBookmarks() {
           </ContextMenuItem>
           <ContextMenuItem onClick={handleBookmarkDeleteFromMenu}>
             삭제
+          </ContextMenuItem>
+        </ContextMenu>
+      )}
+
+      {/* 🔹 '폴더 없음' 컨텍스트 메뉴 */}
+      {contextMenu.visible && contextMenu.type === "unassigned" && (
+        <ContextMenu
+          $x={contextMenu.x}
+          $y={contextMenu.y}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <ContextMenuItem onClick={handleUnassignedDeleteAllFromMenu}>
+            '폴더 없음' 즐겨찾기 모두 삭제
           </ContextMenuItem>
         </ContextMenu>
       )}
