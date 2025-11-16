@@ -2,22 +2,67 @@ import React, { forwardRef } from "react";
 import styled from "styled-components";
 
 const ToolbarContainer = styled.div`
-  position: sticky;
+  position: sticky; /* 스크롤 시 상단 고정 */
   top: 0;
   z-index: 10;
   background: #fff;
   margin: 0;
   padding: 10px;
+
+  /* ✅ 3칸 그리드: 왼쪽(auto) | 가운데(1fr) | 오른쪽(auto) */
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  column-gap: 10px;
+  border-bottom: 1px solid #eee;
+
+  /* 화면이 좁아지면 세로로 3줄로 쌓기 */
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto; /* 왼쪽 / 가운데 / 오른쪽 순서 */
+    row-gap: 6px;
+  }
+`;
+
+// 왼쪽 영역
+const LeftGroup = styled.div`
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex-shrink: 0;
-  border-bottom: 1px solid #eee;
+  gap: 8px;
+
+  @media (max-width: 900px) {
+    justify-content: flex-start;
+  }
+`;
+
+// ✅ 가운데 영역: 그리드의 가운데 셀, 항상 중앙 정렬
+const CenterGroup = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: center; /* 가운데 셀 안에서 수평 중앙 */
+  margin-left: 200px;
+
+  @media (max-width: 900px) {
+    /* 좁을 때도 가운데 정렬 유지 */
+    justify-self: center;
+  }
+`;
+
+// 오른쪽 영역
+const RightGroup = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end; /* 오른쪽 셀에서 오른쪽 끝 */
+
+  @media (max-width: 900px) {
+    justify-self: flex-end;
+  }
 `;
 
 // 확대/축소 툴바
 const ZoomToolbar = styled.div`
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -94,13 +139,58 @@ const PdfToolbar = forwardRef(
   ) => {
     return (
       <ToolbarContainer ref={ref}>
-        {/* 파일 열기 */}
-        <input type="file" accept="application/pdf" onChange={onFileChange} />
+        {/* 왼쪽 영역 */}
+        <LeftGroup>
+          {/* 파일 열기 */}
+          {/* <input type="file" accept="application/pdf" onChange={onFileChange} /> */}
 
+          {pdfLoaded && (
+            <>
+              {/* 형광펜 토글 */}
+              <button
+                type="button"
+                onClick={onToggleHighlight}
+                style={{
+                  padding: "4px 8px",
+                  fontSize: "12px",
+                  borderRadius: "4px",
+                  border: "1px solid #ccc",
+                  background: isHighlightMode ? "#fff7c2" : "#f8f8f8",
+                  whiteSpace: "nowrap",
+                  cursor: "pointer",
+                }}
+              >
+                🖍 형광펜
+              </button>
+
+              {/* 지우개 토글 */}
+              <button
+                type="button"
+                onClick={onToggleErase}
+                style={{
+                  padding: "4px 8px",
+                  fontSize: "12px",
+                  borderRadius: "4px",
+                  border: "1px solid #ccc",
+                  background: isEraseMode ? "#ffe4e4" : "#f8f8f8",
+                  whiteSpace: "nowrap",
+                  cursor: "pointer",
+                }}
+              >
+                🧽 지우개
+              </button>
+            </>
+          )}
+        </LeftGroup>
+
+        {/* 가운데 영역: 페이지 네비게이션 */}
         {pdfLoaded && (
-          <>
-            {/* 페이지 이동 */}
-            <button type="button" onClick={onPrevPage}>
+          <CenterGroup>
+            <button
+              type="button"
+              onClick={onPrevPage}
+              style={{ whiteSpace: "nowrap" }}
+            >
               ◀ 이전
             </button>
 
@@ -116,51 +206,27 @@ const PdfToolbar = forwardRef(
                 }
               }}
             />
-            <span>/ {totalPages}</span>
+            <span style={{ whiteSpace: "nowrap" }}>/ {totalPages}</span>
 
-            <button type="button" onClick={onNextPage}>
+            <button
+              type="button"
+              onClick={onNextPage}
+              style={{ whiteSpace: "nowrap" }}
+            >
               다음 ▶
             </button>
+          </CenterGroup>
+        )}
 
-            {/* 형광펜 토글 */}
-            <button
-              type="button"
-              onClick={onToggleHighlight}
-              style={{
-                padding: "4px 8px",
-                fontSize: "12px",
-                borderRadius: "4px",
-                border: "1px solid #ccc",
-                background: isHighlightMode ? "#fff7c2" : "#f8f8f8",
-                cursor: "pointer",
-              }}
-            >
-              🖍 형광펜 {isHighlightMode ? "ON" : "OFF"}
-            </button>
-
-            {/* 지우개 토글 */}
-            <button
-              type="button"
-              onClick={onToggleErase}
-              style={{
-                padding: "4px 8px",
-                fontSize: "12px",
-                borderRadius: "4px",
-                border: "1px solid #ccc",
-                background: isEraseMode ? "#ffe4e4" : "#f8f8f8",
-                cursor: "pointer",
-              }}
-            >
-              🧽 지우개 {isEraseMode ? "ON" : "OFF"}
-            </button>
-
+        {/* 오른쪽 영역: 줌 컨트롤 */}
+        {pdfLoaded && (
+          <RightGroup>
             {/* 텍스트 검색 */}
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
                 gap: 4,
-                marginLeft: 8,
               }}
             >
               <input
@@ -195,6 +261,7 @@ const PdfToolbar = forwardRef(
                   border: "1px solid #ccc",
                   background: "#f8f8f8",
                   cursor: "pointer",
+                  whiteSpace: "nowrap",
                 }}
               >
                 검색
@@ -208,39 +275,7 @@ const PdfToolbar = forwardRef(
               >
                 {hasSearchResults ? `${searchIndex + 1} / ${searchTotal}` : ""}
               </span>
-              <button
-                type="button"
-                disabled={!hasSearchResults}
-                onClick={() => onGotoMatch(searchIndex - 1)}
-                style={{
-                  fontSize: 12,
-                  padding: "2px 4px",
-                  borderRadius: 4,
-                  border: "1px solid #ccc",
-                  background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
-                  cursor: hasSearchResults ? "pointer" : "default",
-                }}
-              >
-                ◀
-              </button>
-              <button
-                type="button"
-                disabled={!hasSearchResults}
-                onClick={() => onGotoMatch(searchIndex + 1)}
-                style={{
-                  fontSize: 12,
-                  padding: "2px 4px",
-                  borderRadius: 4,
-                  border: "1px solid #ccc",
-                  background: hasSearchResults ? "#f8f8f8" : "#f0f0f0",
-                  cursor: hasSearchResults ? "pointer" : "default",
-                }}
-              >
-                ▶
-              </button>
             </div>
-
-            {/* 줌 컨트롤 */}
             <ZoomToolbar>
               <ZoomButton type="button" onClick={onZoomOut}>
                 -
@@ -253,7 +288,7 @@ const PdfToolbar = forwardRef(
                 100%
               </ZoomResetButton>
             </ZoomToolbar>
-          </>
+          </RightGroup>
         )}
       </ToolbarContainer>
     );

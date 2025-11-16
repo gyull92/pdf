@@ -970,20 +970,96 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // 중앙 본문 Ctrl+휠 줌
   const handleWheel = (e) => {
+    // Ctrl이 아닐 땐 그냥 스크롤
     if (!e.ctrlKey) return;
 
     if (e.cancelable) {
       e.preventDefault();
     }
 
-    const isZoomOut = e.deltaY > 0;
-    setScale((prev) => {
-      if (isZoomOut) {
-        return Math.max(prev - SCALE_STEP, MIN_SCALE);
+    const container = mainRef.current;
+    if (!container) return;
+
+    const clientY = e.clientY;
+
+    // 1) 마우스와 가장 가까운 페이지(canvas) 찾기
+    const canvases = canvasRefs.current;
+    let targetIndex = -1;
+    let minDist = Infinity;
+
+    canvases.forEach((canvas, idx) => {
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+
+      // 마우스가 이 페이지 안에 있는 경우
+      if (clientY >= rect.top && clientY <= rect.bottom) {
+        if (0 < minDist) {
+          minDist = 0;
+          targetIndex = idx;
+        }
+      } else {
+        // 위/아래에 있을 경우 거리가 가장 가까운 페이지를 선택
+        const dist = Math.min(
+          Math.abs(clientY - rect.top),
+          Math.abs(clientY - rect.bottom)
+        );
+        if (dist < minDist) {
+          minDist = dist;
+          targetIndex = idx;
+        }
       }
-      return Math.min(prev + SCALE_STEP, MAX_SCALE);
+    });
+
+    if (targetIndex === -1) return;
+
+    const targetCanvas = canvases[targetIndex];
+    const pageRect = targetCanvas.getBoundingClientRect();
+
+    // 2) 이 페이지 안에서의 상대 위치 (0 ~ 1)
+    const relY = (clientY - pageRect.top) / pageRect.height;
+
+    const prevScale = scale;
+    const isZoomOut = e.deltaY > 0;
+
+    let nextScale = isZoomOut
+      ? Math.max(prevScale - SCALE_STEP, MIN_SCALE)
+      : Math.min(prevScale + SCALE_STEP, MAX_SCALE);
+
+    if (nextScale === prevScale) return;
+
+    // 먼저 scale 변경
+    setScale(nextScale);
+
+    const savedRelY = relY;
+    const savedTargetIndex = targetIndex;
+
+    const adjustScroll = () => {
+      const c = mainRef.current;
+      const canvasAfter = canvasRefs.current[savedTargetIndex];
+      if (!c || !canvasAfter) return;
+
+      const rectAfter = canvasAfter.getBoundingClientRect();
+      const clampedRelY = Math.min(Math.max(savedRelY, 0), 1);
+
+      // 확대 후에도 같은 상대 위치가 clientY에 오도록 만들겠다는 목표
+      const targetY = rectAfter.top + clampedRelY * rectAfter.height;
+
+      // targetY 가 현재 clientY와 얼마나 차이나는가
+      const delta = targetY - clientY;
+
+      let newScrollTop = c.scrollTop + delta;
+      const maxScrollTop = c.scrollHeight - c.clientHeight;
+
+      if (newScrollTop < 0) newScrollTop = 0;
+      if (newScrollTop > maxScrollTop) newScrollTop = maxScrollTop;
+
+      c.scrollTop = newScrollTop;
+    };
+
+    // 렌더링이 반영된 뒤에 위치 보정 (두 프레임 정도 여유)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(adjustScroll);
     });
   };
 
