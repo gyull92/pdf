@@ -1,6 +1,6 @@
 {
   "name": "gyul-pdf-viewer",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "description": "즐겨찾기 기능이 포함된 윈도우용 PDF 뷰어",
   "type": "module",
   "main": "electron/main.cjs",
@@ -8,7 +8,7 @@
     "dev": "npx concurrently \"npx vite\" \"npx electron electron/main.cjs\"",
     "build": "npx vite build",
     "start": "npx electron electron/main.cjs",
-    "dist": "npm run build && npx electron-builder build --win"
+    "dist": "npm run build && npx electron-builder"
   },
   "build": {
     "appId": "com.gyul.pdfviewer",
@@ -27,8 +27,11 @@
       "target": "nsis",
       "icon": "mandarinPDF3.ico"
     },
+    "mac": {
+      "target": "dmg",
+      "icon": "mandarinPDF3.icns"
+    },
     "publish": null,
-    "mac": null,
     "fileAssociations": [
       {
         "ext": "pdf",

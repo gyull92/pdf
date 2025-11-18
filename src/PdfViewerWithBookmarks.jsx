@@ -161,7 +161,8 @@ const HighlightCanvas = styled.canvas`
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
-const INITIAL_SCALE = 1.0;
+const INITIAL_SCALE = 1.5; // 기본 150%
+const ACTUAL_SIZE_SCALE = 1.0; // 100%
 
 // 형광펜 색상
 const DEFAULT_HIGHLIGHT_COLOR = "rgba(0, 255, 0, 1)";
@@ -335,27 +336,60 @@ export default function PdfViewerWithBookmarks() {
     };
   }, []);
 
-  // 로컬 스토리지 로드
+  // ✅ 북마크/하이라이트 로드 (localStorage + IPC)
   useEffect(() => {
-    const saved = localStorage.getItem("gyul-pdf-bookmarks");
-    if (saved) setBookmarks(JSON.parse(saved));
+    // 1) localStorage에서 먼저 로드 (이전 버전 호환)
+    const savedLocalBookmarks = localStorage.getItem("gyul-pdf-bookmarks");
+    if (savedLocalBookmarks) {
+      try {
+        setBookmarks(JSON.parse(savedLocalBookmarks));
+      } catch (e) {
+        console.warn("localStorage 북마크 파싱 실패:", e);
+      }
+    }
 
     const savedHighlights = localStorage.getItem("gyul-pdf-highlights");
-    if (savedHighlights) setHighlights(JSON.parse(savedHighlights));
+    if (savedHighlights) {
+      try {
+        setHighlights(JSON.parse(savedHighlights));
+      } catch (e) {}
+    }
 
     const savedTextHighlights = localStorage.getItem(
       "gyul-pdf-text-highlights"
     );
     if (savedTextHighlights) {
-      setTextHighlights(JSON.parse(savedTextHighlights));
+      try {
+        setTextHighlights(JSON.parse(savedTextHighlights));
+      } catch (e) {}
     }
+
+    // 2) Electron의 영구 파일(bookmarks.json)에서 다시 덮어쓰기
+    (async () => {
+      if (!ipcRenderer) return;
+      try {
+        const fileBookmarks = await ipcRenderer.invoke("load-bookmarks");
+        if (Array.isArray(fileBookmarks)) {
+          setBookmarks(fileBookmarks);
+        }
+      } catch (e) {
+        console.warn("파일에서 북마크 로드 실패:", e);
+      }
+    })();
   }, []);
 
-  // 저장
+  // ✅ 북마크 저장: localStorage + IPC 모두 저장
   useEffect(() => {
-    localStorage.setItem("gyul-pdf-bookmarks", JSON.stringify(bookmarks));
+    try {
+      localStorage.setItem("gyul-pdf-bookmarks", JSON.stringify(bookmarks));
+    } catch (e) {}
+
+    if (ipcRenderer) {
+      ipcRenderer.send("save-bookmarks", bookmarks);
+    }
   }, [bookmarks]);
 
+  // 하이라이트는 그대로 localStorage만 사용
   useEffect(() => {
     localStorage.setItem("gyul-pdf-highlights", JSON.stringify(highlights));
   }, [highlights]);
@@ -1112,7 +1146,6 @@ export default function PdfViewerWithBookmarks() {
           Math.abs(clientY - rect.bottom)
         );
         if (dist < minDist) {
-          minDist = dist;
           targetIndex = idx;
         }
       }
@@ -1365,7 +1398,8 @@ export default function PdfViewerWithBookmarks() {
   };
 
   const handleResetZoom = () => {
-    setScale(INITIAL_SCALE);
+    // 100% 버튼 → 실제 크기
+    setScale(ACTUAL_SIZE_SCALE);
   };
 
   // 지우개 (캔버스 형광펜)
@@ -1999,20 +2033,6 @@ export default function PdfViewerWithBookmarks() {
     </Container>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // import { useState, useEffect, useRef } from "react";
 // import styled from "styled-components";

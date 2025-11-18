@@ -83,13 +83,14 @@ const BookmarkHeaderTopRow = styled.div`
 `;
 
 const BookmarkFileName = styled.span`
+  width: 190px;
   font-size: 11px;
   color: #333;
   display: -webkit-box;
-  -webkit-line-clamp: 2; /* 최대 2줄 */
+  -webkit-line-clamp: 1; /* 최대 1줄 */
   -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis; /* 2줄 넘으면 ... 처리 */
+  text-overflow: ellipsis; /* 1줄 넘으면 ... 처리 */
   word-break: break-all; /* 칸 좁을 때 단어 중간이라도 줄바꿈 */
 `;
 
