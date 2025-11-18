@@ -22,6 +22,13 @@ if (typeof window !== "undefined" && window.require) {
   }
 }
 
+// 🔹 파일 드래그인지 판별하는 헬퍼 (북마크 드래그와 구분용)
+const isFileDragEvent = (e) => {
+  const dt = e.dataTransfer;
+  if (!dt) return false;
+  return Array.from(dt.types || []).includes("Files");
+};
+
 // 레이아웃
 const Container = styled.div`
   display: flex;
@@ -38,7 +45,7 @@ const Center = styled.div`
   min-width: 0;
 `;
 
-// 상단 탭 바 (크롬 탭 느낌)
+// 상단 탭 바
 const TabBar = styled.div`
   display: flex;
   align-items: flex-end;
@@ -92,7 +99,7 @@ const TabCloseButton = styled.button`
   }
 `;
 
-// 형광펜 / 지우개 모드일 때 커서 변경
+// 메인 영역 (커서 모드 변경)
 const Main = styled.div`
   flex: 1;
   display: flex;
@@ -100,17 +107,14 @@ const Main = styled.div`
   overflow: auto;
   position: relative;
 
-  cursor: ${({ $erase, $textHighlight, $freeHighlight }) => {
-    if ($erase) {
-      // 🧽 지우개 모드
+  cursor: ${(props) => {
+    if (props.$erase) {
       return `url(${eraserCursor}) 6 6, auto`;
     }
-    if ($textHighlight) {
-      // ✏️ 글자 형광펜
+    if (props.$textHighlight) {
       return `url(${colorPenCursor}) 4 18, auto`;
     }
-    if ($freeHighlight) {
-      // 🟩 자유영역 형광펜
+    if (props.$freeHighlight) {
       return `url(${freeAreaCursor}) 4 18, crosshair`;
     }
     return "default";
@@ -124,7 +128,7 @@ const PagesWrapper = styled.div`
   padding-bottom: 40px;
 `;
 
-// 각 페이지 컨테이너 (캔버스 + 텍스트 레이어)
+// 각 페이지 컨테이너
 const PageContainer = styled.div`
   position: relative;
   margin-bottom: 20px;
@@ -134,21 +138,21 @@ const PageContainer = styled.div`
 const Canvas = styled.canvas`
   box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
 
-  cursor: ${({ $erase, $textHighlight, $freeHighlight }) => {
-    if ($erase) {
+  cursor: ${(props) => {
+    if (props.$erase) {
       return `url(${eraserCursor}) 6 6, auto`;
     }
-    if ($textHighlight) {
+    if (props.$textHighlight) {
       return `url(${colorPenCursor}) 4 18, auto`;
     }
-    if ($freeHighlight) {
+    if (props.$freeHighlight) {
       return `url(${freeAreaCursor}) 4 18, crosshair`;
     }
     return "default";
   }};
 `;
 
-// ✅ 형광펜 전용 캔버스 (PDF 위에 얹는 레이어)
+// 형광펜 전용 캔버스
 const HighlightCanvas = styled.canvas`
   position: absolute;
   left: 0;
@@ -161,13 +165,13 @@ const HighlightCanvas = styled.canvas`
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
-const INITIAL_SCALE = 1.5; // 기본 150%
-const ACTUAL_SIZE_SCALE = 1.0; // 100%
+const INITIAL_SCALE = 1.5;
+const ACTUAL_SIZE_SCALE = 1.0;
 
 // 형광펜 색상
-const DEFAULT_HIGHLIGHT_COLOR = "rgba(0, 255, 0, 1)";
+const DEFAULT_HIGHLIGHT_COLOR = "rgba(0, 255, 0, 0.6)";
 
-// PDF 페이지 위에 텍스트 레이어(span들)를 직접 그리는 헬퍼
+// 텍스트 레이어 직접 렌더
 const renderTextLayerOnPage = async (page, viewport, container) => {
   if (!container) return;
 
@@ -179,7 +183,6 @@ const renderTextLayerOnPage = async (page, viewport, container) => {
   container.style.position = "absolute";
   container.style.left = "0";
   container.style.top = "0";
-  container.style.pointerEvents = "none";
 
   const textItems = textContent.items || [];
   const styles = textContent.styles || {};
@@ -197,11 +200,12 @@ const renderTextLayerOnPage = async (page, viewport, container) => {
 
     const span = document.createElement("span");
     span.textContent = text;
+    span.dataset.spanIndex = String(index);
+    span.dataset.rawText = text;
     span.style.position = "absolute";
     span.style.whiteSpace = "pre";
     span.style.fontSize = `${fontHeight}px`;
-    span.dataset.spanIndex = String(index); // ✅ 글자 형광펜용 인덱스
-    span.style.cursor = "inherit"; // 부모 cursor 따라가도록
+    span.style.cursor = "inherit";
 
     const font = styles[item.fontName];
     if (font && font.fontFamily) {
@@ -217,19 +221,6 @@ const renderTextLayerOnPage = async (page, viewport, container) => {
   container.appendChild(frag);
 };
 
-// ✅ span 안에서 selection 기준 글자 인덱스 계산
-const getCharIndexInSpan = (span, node, offset) => {
-  try {
-    const range = document.createRange();
-    range.selectNodeContents(span);
-    range.setEnd(node, offset);
-    const text = range.toString();
-    return text.length;
-  } catch (e) {
-    return 0;
-  }
-};
-
 export default function PdfViewerWithBookmarks() {
   const [pdf, setPdf] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
@@ -238,74 +229,55 @@ export default function PdfViewerWithBookmarks() {
 
   const [bookmarks, setBookmarks] = useState([]);
   const [fileName, setFileName] = useState("");
-  const [filePath, setFilePath] = useState(""); // 현재 PDF 파일 경로
+  const [filePath, setFilePath] = useState("");
   const [thumbnails, setThumbnails] = useState([]);
 
-  // 여러 PDF 탭
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
   const [draggingTabId, setDraggingTabId] = useState(null);
 
-  // 페이지 텍스트 (텍스트 검색용)
   const [pageTexts, setPageTexts] = useState([]);
 
-  // 검색 상태
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchMatches, setSearchMatches] = useState([]); // { page, start, end }
+  const [searchMatches, setSearchMatches] = useState([]);
   const [searchIndex, setSearchIndex] = useState(0);
 
-  // 본문 확대/축소
   const [scale, setScale] = useState(INITIAL_SCALE);
 
-  // 왼쪽 접힘 상태 (오른쪽은 별도 컴포넌트)
   const [isLeftCollapsed, setIsLeftCollapsed] = useState(false);
-
-  // 왼쪽 썸네일 확대/축소 배율
   const [thumbnailScale, setThumbnailScale] = useState(1);
-  // 왼쪽 목록: 즐겨찾기만 보기 토글 상태
   const [showOnlyBookmarked, setShowOnlyBookmarked] = useState(false);
 
-  // 드래그 오버 상태
   const [isDragOver, setIsDragOver] = useState(false);
 
   const canvasRefs = useRef([]);
   const textLayerRefs = useRef([]);
-  const highlightCanvasRefs = useRef([]); // ✅ 형광펜 캔버스 ref
-  const pageContainerRefs = useRef([]); // ✅ 각 페이지 컨테이너 ref
+  const highlightCanvasRefs = useRef([]);
+  const pageContainerRefs = useRef([]);
   const mainRef = useRef(null);
   const toolbarRef = useRef(null);
-  const scrollTickingRef = useRef(false);
   const currentPageRef = useRef(1);
 
-  // 형광펜 / 지우개 상태
-  const [isHighlightMode, setIsHighlightMode] = useState(false); // 캔버스 형광펜
+  // 모드 상태
+  const [isHighlightMode, setIsHighlightMode] = useState(false); // 자유영역 형광펜
   const [isTextHighlightMode, setIsTextHighlightMode] = useState(false); // 글자 형광펜
   const [isEraseMode, setIsEraseMode] = useState(false);
-  const [highlights, setHighlights] = useState([]); // 캔버스 형광펜
-  const [textHighlights, setTextHighlights] = useState([]); // 🔤 글자 형광펜
+
+  // 모든 형광펜(자유 + 글자)을 사각형으로 저장
+  const [highlights, setHighlights] = useState([]);
   const highlightStartRef = useRef(null);
 
-  // PDF 문서 캐시 (세션 동안만 유지)
   const pdfCacheRef = useRef({});
-
-  // 썸네일 렌더 세대 관리
   const thumbnailGenerationRef = useRef(0);
 
-  // currentPageRef 동기화
   useEffect(() => {
     currentPageRef.current = currentPage;
   }, [currentPage]);
 
-  // 전역 드래그앤드롭 처리 (브라우저 기본 동작 막기 + 드래그 상태만 관리)
+  // 🔹 전역 드래그앤드롭 (파일 드래그에만 반응)
   useEffect(() => {
-    const isFileDrag = (e) => {
-      const dt = e.dataTransfer;
-      if (!dt) return false;
-      return Array.from(dt.types || []).includes("Files");
-    };
-
     const handleWindowDragOver = (e) => {
-      if (!isFileDrag(e)) return;
+      if (!isFileDragEvent(e)) return;
       e.preventDefault();
       if (e.dataTransfer) {
         e.dataTransfer.dropEffect = "copy";
@@ -314,13 +286,13 @@ export default function PdfViewerWithBookmarks() {
     };
 
     const handleWindowDragLeave = (e) => {
-      if (!isFileDrag(e)) return;
+      if (!isFileDragEvent(e)) return;
       e.preventDefault();
       setIsDragOver(false);
     };
 
     const handleWindowDrop = (e) => {
-      if (!isFileDrag(e)) return;
+      if (!isFileDragEvent(e)) return;
       e.preventDefault();
       setIsDragOver(false);
     };
@@ -336,9 +308,8 @@ export default function PdfViewerWithBookmarks() {
     };
   }, []);
 
-  // ✅ 북마크/하이라이트 로드 (localStorage + IPC)
+  // 북마크/형광펜 로드
   useEffect(() => {
-    // 1) localStorage에서 먼저 로드 (이전 버전 호환)
     const savedLocalBookmarks = localStorage.getItem("gyul-pdf-bookmarks");
     if (savedLocalBookmarks) {
       try {
@@ -352,19 +323,11 @@ export default function PdfViewerWithBookmarks() {
     if (savedHighlights) {
       try {
         setHighlights(JSON.parse(savedHighlights));
-      } catch (e) {}
+      } catch (e) {
+        console.warn("localStorage 하이라이트 파싱 실패:", e);
+      }
     }
 
-    const savedTextHighlights = localStorage.getItem(
-      "gyul-pdf-text-highlights"
-    );
-    if (savedTextHighlights) {
-      try {
-        setTextHighlights(JSON.parse(savedTextHighlights));
-      } catch (e) {}
-    }
-
-    // 2) Electron의 영구 파일(bookmarks.json)에서 다시 덮어쓰기
     (async () => {
       if (!ipcRenderer) return;
       try {
@@ -378,7 +341,7 @@ export default function PdfViewerWithBookmarks() {
     })();
   }, []);
 
-  // ✅ 북마크 저장: localStorage + IPC 모두 저장
+  // 북마크 저장
   useEffect(() => {
     try {
       localStorage.setItem("gyul-pdf-bookmarks", JSON.stringify(bookmarks));
@@ -389,24 +352,19 @@ export default function PdfViewerWithBookmarks() {
     }
   }, [bookmarks]);
 
-  // 하이라이트는 그대로 localStorage만 사용
+  // 형광펜 저장
   useEffect(() => {
-    localStorage.setItem("gyul-pdf-highlights", JSON.stringify(highlights));
+    try {
+      localStorage.setItem("gyul-pdf-highlights", JSON.stringify(highlights));
+    } catch (e) {}
   }, [highlights]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      "gyul-pdf-text-highlights",
-      JSON.stringify(textHighlights)
-    );
-  }, [textHighlights]);
 
   // 페이지 입력 동기화
   useEffect(() => {
     setPageInput(String(currentPage));
   }, [currentPage]);
 
-  // 현재 활성 탭에 상태 저장
+  // 활성 탭 상태 동기화
   useEffect(() => {
     if (!activeTabId) return;
 
@@ -447,23 +405,38 @@ export default function PdfViewerWithBookmarks() {
     searchIndex,
   ]);
 
-  // 검색된 텍스트 하이라이트 (검색용 - 파란색)
+  // 검색 하이라이트(파란색)만 DOM에 적용
   const applySearchHighlightForPage = (pageNum) => {
     const q = searchQuery.trim();
-    if (!q) return;
-
     const textLayerDiv = textLayerRefs.current[pageNum - 1];
     if (!textLayerDiv) return;
 
+    const spans = textLayerDiv.querySelectorAll("span[data-span-index]");
+
+    if (!q) {
+      spans.forEach((span) => {
+        const el = span;
+        const rawText = el.dataset.rawText || el.textContent || "";
+        el.innerHTML = "";
+        el.appendChild(document.createTextNode(rawText));
+      });
+      return;
+    }
+
     const lowerQ = q.toLowerCase();
-    const spans = textLayerDiv.querySelectorAll("span");
 
     spans.forEach((span) => {
-      const fullText = span.textContent || "";
+      const el = span;
+      const rawText = el.dataset.rawText || el.textContent || "";
+      const fullText = rawText;
       const lowerText = fullText.toLowerCase();
 
       let index = lowerText.indexOf(lowerQ);
-      if (index === -1) return;
+      if (index === -1) {
+        el.innerHTML = "";
+        el.appendChild(document.createTextNode(fullText));
+        return;
+      }
 
       const frag = document.createDocumentFragment();
       let lastIndex = 0;
@@ -476,7 +449,7 @@ export default function PdfViewerWithBookmarks() {
         }
         const mark = document.createElement("span");
         mark.textContent = fullText.slice(index, index + q.length);
-        mark.style.backgroundColor = "rgba(10, 59, 255, 1)";
+        mark.style.backgroundColor = "rgba(10, 59, 255, 0.8)";
         frag.appendChild(mark);
         lastIndex = index + q.length;
         index = lowerText.indexOf(lowerQ, lastIndex);
@@ -486,111 +459,32 @@ export default function PdfViewerWithBookmarks() {
         frag.appendChild(document.createTextNode(fullText.slice(lastIndex)));
       }
 
-      span.innerHTML = "";
-      span.appendChild(frag);
+      el.innerHTML = "";
+      el.appendChild(frag);
     });
   };
 
-  // 🔤 글자 형광펜 렌더링
-  const applyTextHighlightsForPage = (pageNum) => {
-    const container = textLayerRefs.current[pageNum - 1];
-    if (!container) return;
-
-    const spans = container.querySelectorAll("span[data-span-index]");
-    spans.forEach((span) => {
-      const spanIndexStr = span.dataset.spanIndex;
-      if (spanIndexStr == null) return;
-      const spanIndex = Number(spanIndexStr);
-      if (Number.isNaN(spanIndex)) return;
-
-      const fullText = span.textContent || "";
-      const related = textHighlights
-        .filter(
-          (h) =>
-            h.fileName === fileName &&
-            h.page === pageNum &&
-            h.spanIndex === spanIndex
-        )
-        .sort((a, b) => a.start - b.start);
-
-      if (related.length === 0) {
-        // 형광펜 없으면 그냥 텍스트만 유지
-        span.innerHTML = "";
-        span.appendChild(document.createTextNode(fullText));
-        return;
-      }
-
-      const frag = document.createDocumentFragment();
-      let cursor = 0;
-
-      related.forEach((h) => {
-        const start = Math.max(0, Math.min(h.start, fullText.length));
-        const end = Math.max(start, Math.min(h.end, fullText.length));
-        if (start > cursor) {
-          frag.appendChild(
-            document.createTextNode(fullText.slice(cursor, start))
-          );
-        }
-        if (start < end) {
-          const mark = document.createElement("span");
-          mark.textContent = fullText.slice(start, end);
-          mark.style.backgroundColor = DEFAULT_HIGHLIGHT_COLOR;
-          frag.appendChild(mark);
-        }
-        cursor = end;
-      });
-
-      if (cursor < fullText.length) {
-        frag.appendChild(document.createTextNode(fullText.slice(cursor)));
-      }
-
-      span.innerHTML = "";
-      span.appendChild(frag);
-    });
-  };
-
-  // Ctrl+Z 되돌리기 (글자 형광펜 + 캔버스 형광펜)
+  // Ctrl+Z: 마지막 형광펜 한 개 삭제
   useEffect(() => {
     const handleKeyDown = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         if (!fileName) return;
 
-        // 1️⃣ 먼저 글자 형광펜 되돌리기
-        let removedText = false;
-        setTextHighlights((prev) => {
+        setHighlights((prev) => {
           let targetIndex = -1;
-          let latestTime = -Infinity;
+          let latest = -Infinity;
 
           for (let i = 0; i < prev.length; i++) {
             const h = prev[i];
             if (h.fileName !== fileName) continue;
-            const t = h.createdAt ?? 0;
-            if (t >= latestTime) {
-              latestTime = t;
+            const t = h.createdAt || 0;
+            if (t >= latest) {
+              latest = t;
               targetIndex = i;
             }
           }
 
-          if (targetIndex === -1) return prev;
-          removedText = true;
-          const next = [...prev];
-          next.splice(targetIndex, 1);
-          return next;
-        });
-
-        if (removedText) return;
-
-        // 2️⃣ 글자 형광펜이 없으면 캔버스 형광펜 되돌리기
-        setHighlights((prev) => {
-          if (!fileName) return prev;
-          let targetIndex = -1;
-          for (let i = prev.length - 1; i >= 0; i--) {
-            if (prev[i].fileName === fileName) {
-              targetIndex = i;
-              break;
-            }
-          }
           if (targetIndex === -1) return prev;
           const next = [...prev];
           next.splice(targetIndex, 1);
@@ -603,7 +497,7 @@ export default function PdfViewerWithBookmarks() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [fileName]);
 
-  // 한 페이지 렌더 (PDF + 텍스트레이어, 형광펜 캔버스 사이즈만 맞춤)
+  // 한 페이지 렌더
   const renderPage = async (num, scaleValue = scale) => {
     if (!pdf) return;
     const canvas = canvasRefs.current[num - 1];
@@ -615,27 +509,24 @@ export default function PdfViewerWithBookmarks() {
     const page = await pdf.getPage(num);
     const viewport = page.getViewport({ scale: scaleValue });
     const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
     canvas.height = viewport.height;
     canvas.width = viewport.width;
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     await page.render({ canvasContext: ctx, viewport }).promise;
     await renderTextLayerOnPage(page, viewport, textLayerDiv);
 
-    // 형광펜 캔버스도 크기 맞추기
     if (highlightCanvas) {
       highlightCanvas.width = canvas.width;
       highlightCanvas.height = canvas.height;
     }
 
-    // 검색 하이라이트 (파란색) → 그 다음 글자 형광펜(초록색) 적용
     applySearchHighlightForPage(num);
-    applyTextHighlightsForPage(num);
   };
 
-  // 전체 페이지 렌더 (PDF만 다시 그림)
+  // 전체 페이지 렌더
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
 
@@ -649,7 +540,9 @@ export default function PdfViewerWithBookmarks() {
         if (!pageNum) break;
         try {
           await renderPage(pageNum, scale);
-        } catch (e) {}
+        } catch (e) {
+          console.error(e);
+        }
       }
     };
 
@@ -661,11 +554,12 @@ export default function PdfViewerWithBookmarks() {
     return () => {
       cancelled = true;
     };
-  }, [pdf, totalPages, scale, searchMatches]);
+  }, [pdf, totalPages, scale, searchMatches, searchQuery]);
 
-  // ✅ 형광펜(캔버스)만 별도 캔버스에 다시 그리기
+  // 형광펜(자유+글자) 캔버스에 그리기
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
+    if (!fileName) return;
 
     for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
       const baseCanvas = canvasRefs.current[pageNum - 1];
@@ -675,7 +569,6 @@ export default function PdfViewerWithBookmarks() {
       const ctx = highlightCanvas.getContext("2d");
       if (!ctx) continue;
 
-      // PDF 캔버스 크기에 맞춰주기 (사이즈 변경 시 자동 clear)
       if (
         highlightCanvas.width !== baseCanvas.width ||
         highlightCanvas.height !== baseCanvas.height
@@ -695,19 +588,11 @@ export default function PdfViewerWithBookmarks() {
         const y = h.y * highlightCanvas.height;
         const w = h.width * highlightCanvas.width;
         const hgt = h.height * highlightCanvas.height;
-        ctx.fillStyle = DEFAULT_HIGHLIGHT_COLOR;
+        ctx.fillStyle = h.color || DEFAULT_HIGHLIGHT_COLOR;
         ctx.fillRect(x, y, w, hgt);
       });
     }
   }, [highlights, pdf, totalPages, scale, fileName]);
-
-  // 🔤 글자 형광펜만 다시 적용
-  useEffect(() => {
-    if (!pdf || totalPages === 0) return;
-    for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-      applyTextHighlightsForPage(pageNum);
-    }
-  }, [textHighlights, pdf, totalPages, fileName]);
 
   // 썸네일 생성
   const generateThumbnails = async (pdfDoc, generation) => {
@@ -757,7 +642,7 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // PDF 로딩 핵심 로직 (buffer + 파일명 기반, 여러 탭 + 경로 지원)
+  // PDF 로딩
   const loadPdfFromArrayBuffer = async (
     arrayBuffer,
     name,
@@ -767,26 +652,21 @@ export default function PdfViewerWithBookmarks() {
     if (!arrayBuffer) return;
 
     const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
     const cacheKey = sourcePath || name;
     pdfCacheRef.current[cacheKey] = pdfDoc;
 
     const total = pdfDoc.numPages;
     const thumbnailsInit = new Array(total).fill(null);
 
-    // ❗ 탭 생성/업데이트는 항상 prev 기반으로 처리
     let resolvedTabId = null;
 
     setTabs((prev) => {
-      // 1) 경로 기준으로 먼저 찾고, 없으면 이름으로 찾기
       const byPath =
         sourcePath != null ? prev.find((t) => t.filePath === sourcePath) : null;
       const byName = prev.find((t) => t.fileName === name);
-
       const existing = byPath || byName;
 
       if (existing) {
-        // 이미 있는 탭이면 그 탭만 업데이트
         resolvedTabId = existing.id;
         return prev.map((t) =>
           t.id === existing.id
@@ -809,7 +689,6 @@ export default function PdfViewerWithBookmarks() {
         );
       }
 
-      // 새 탭 생성
       const newId = `tab-${Date.now()}-${Math.random()}`;
       resolvedTabId = newId;
 
@@ -874,10 +753,8 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // PDF 로드 공통 함수
   const loadPdfFromFile = async (file) => {
     if (!file) return;
-
     const arrayBuffer = await file.arrayBuffer();
     const sourcePath = file.path || null;
     await loadPdfFromArrayBuffer(arrayBuffer, file.name, sourcePath, 1);
@@ -991,19 +868,24 @@ export default function PdfViewerWithBookmarks() {
     await loadPdfFromFile(file);
   };
 
-  // (사용 안 해도 되는 로컬 DnD 핸들러들 - 필요하면 Container에 붙여서 사용 가능)
+  // 🔹 컨테이너 드래그 핸들러도 "파일 드래그"일 때만 동작
   const handleDragOver = (e) => {
+    if (!isFileDragEvent(e)) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = "copy";
+    }
     setIsDragOver(true);
   };
 
   const handleDragLeave = (e) => {
+    if (!isFileDragEvent(e)) return;
     e.preventDefault();
     setIsDragOver(false);
   };
 
   const handleDrop = async (e) => {
+    if (!isFileDragEvent(e)) return;
     e.preventDefault();
     setIsDragOver(false);
 
@@ -1023,6 +905,7 @@ export default function PdfViewerWithBookmarks() {
   };
 
   const handleDragEnter = (e) => {
+    if (!isFileDragEvent(e)) return;
     e.preventDefault();
     if (e.dataTransfer) {
       e.dataTransfer.dropEffect = "copy";
@@ -1070,7 +953,7 @@ export default function PdfViewerWithBookmarks() {
     };
   }, [pdf, totalPages]);
 
-  // 앱 최초 실행 시, OS에서 넘겨준 PDF가 있으면 자동으로 열기
+  // OS에서 처음 열린 PDF
   useEffect(() => {
     if (!ipcRenderer) return;
 
@@ -1088,11 +971,11 @@ export default function PdfViewerWithBookmarks() {
     openInitialPdf();
   }, []);
 
-  // 앱이 이미 켜진 상태에서 다른 PDF를 연결프로그램으로 열었을 때
+  // 실행 중 다른 PDF 열기
   useEffect(() => {
     if (!ipcRenderer) return;
 
-    const handler = (event, path) => {
+    const handler = (_event, path) => {
       if (path) {
         loadPdfFromPath(path, 1);
       }
@@ -1105,14 +988,12 @@ export default function PdfViewerWithBookmarks() {
     };
   }, []);
 
-  // 스크롤 위치 계산 (IntersectionObserver가 대신 currentPage 관리하므로 비워둠)
   const handleScroll = () => {
-    // 필요 시 다른 가벼운 처리만 넣고,
-    // currentPage 계산은 IntersectionObserver에서 수행
+    // currentPage 업데이트는 IntersectionObserver에서 처리
   };
 
+  // Ctrl+휠 줌
   const handleWheel = (e) => {
-    // Ctrl이 아닐 땐 그냥 스크롤
     if (!e.ctrlKey) return;
 
     if (e.cancelable) {
@@ -1123,8 +1004,6 @@ export default function PdfViewerWithBookmarks() {
     if (!container) return;
 
     const clientY = e.clientY;
-
-    // 1) 마우스와 가장 가까운 페이지(canvas) 찾기
     const canvases = canvasRefs.current;
     let targetIndex = -1;
     let minDist = Infinity;
@@ -1133,20 +1012,19 @@ export default function PdfViewerWithBookmarks() {
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
 
-      // 마우스가 이 페이지 안에 있는 경우
       if (clientY >= rect.top && clientY <= rect.bottom) {
         if (0 < minDist) {
           minDist = 0;
           targetIndex = idx;
         }
       } else {
-        // 위/아래에 있을 경우 거리가 가장 가까운 페이지를 선택
         const dist = Math.min(
           Math.abs(clientY - rect.top),
           Math.abs(clientY - rect.bottom)
         );
         if (dist < minDist) {
           targetIndex = idx;
+          minDist = dist;
         }
       }
     });
@@ -1155,8 +1033,6 @@ export default function PdfViewerWithBookmarks() {
 
     const targetCanvas = canvases[targetIndex];
     const pageRect = targetCanvas.getBoundingClientRect();
-
-    // 2) 이 페이지 안에서의 상대 위치 (0 ~ 1)
     const relY = (clientY - pageRect.top) / pageRect.height;
 
     const prevScale = scale;
@@ -1168,7 +1044,6 @@ export default function PdfViewerWithBookmarks() {
 
     if (nextScale === prevScale) return;
 
-    // 먼저 scale 변경
     setScale(nextScale);
 
     const savedRelY = relY;
@@ -1182,10 +1057,7 @@ export default function PdfViewerWithBookmarks() {
       const rectAfter = canvasAfter.getBoundingClientRect();
       const clampedRelY = Math.min(Math.max(savedRelY, 0), 1);
 
-      // 확대 후에도 같은 상대 위치가 clientY에 오도록 만들겠다는 목표
       const targetY = rectAfter.top + clampedRelY * rectAfter.height;
-
-      // targetY 가 현재 clientY와 얼마나 차이나는가
       const delta = targetY - clientY;
 
       let newScrollTop = c.scrollTop + delta;
@@ -1197,13 +1069,12 @@ export default function PdfViewerWithBookmarks() {
       c.scrollTop = newScrollTop;
     };
 
-    // 렌더링이 반영된 뒤에 위치 보정 (두 프레임 정도 여유)
     requestAnimationFrame(() => {
       requestAnimationFrame(adjustScroll);
     });
   };
 
-  // ✅ IntersectionObserver로 currentPage 자연스럽게 업데이트
+  // IntersectionObserver로 현재 페이지 업데이트
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
     if (!mainRef.current) return;
@@ -1245,13 +1116,7 @@ export default function PdfViewerWithBookmarks() {
     };
   }, [pdf, totalPages]);
 
-  // 북마크 추가 버튼 (현재 페이지 토글)
-  const addBookmark = () => {
-    if (!fileName) return;
-    toggleBookmarkPage(currentPage);
-  };
-
-  // 북마크 토글
+  // 북마크
   const toggleBookmarkPage = (pageNum) => {
     if (!fileName) return;
     const key = `${fileName}-${pageNum}`;
@@ -1275,7 +1140,7 @@ export default function PdfViewerWithBookmarks() {
     });
   };
 
-  // 스크롤 위치로 페이지 이동
+  // 스크롤로 페이지 이동
   const scrollToPage = (pageNum) => {
     const canvas = canvasRefs.current[pageNum - 1];
     const container = mainRef.current;
@@ -1299,7 +1164,6 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // 페이지 점프
   const jumpToPage = (pageNum) => {
     if (!totalPages) return;
     const target = Math.min(Math.max(pageNum, 1), totalPages);
@@ -1307,7 +1171,7 @@ export default function PdfViewerWithBookmarks() {
     scrollToPage(target);
   };
 
-  // 북마크로 이동 (오른쪽 컴포넌트에서 사용)
+  // 북마크로 이동
   const goToBookmark = async (bm) => {
     const targetTab = tabs.find((t) =>
       bm.filePath ? t.filePath === bm.filePath : t.fileName === bm.fileName
@@ -1388,7 +1252,7 @@ export default function PdfViewerWithBookmarks() {
     );
   };
 
-  // 본문 줌 핸들러
+  // 줌
   const handleZoomIn = () => {
     setScale((prev) => Math.min(prev + SCALE_STEP, MAX_SCALE));
   };
@@ -1398,11 +1262,10 @@ export default function PdfViewerWithBookmarks() {
   };
 
   const handleResetZoom = () => {
-    // 100% 버튼 → 실제 크기
     setScale(ACTUAL_SIZE_SCALE);
   };
 
-  // 지우개 (캔버스 형광펜)
+  // 지우개: 좌표에 걸린 형광펜 한 개만 삭제
   const eraseHighlightAtPoint = (pageNum, e) => {
     if (!fileName) return;
     const canvas = canvasRefs.current[pageNum - 1];
@@ -1434,20 +1297,18 @@ export default function PdfViewerWithBookmarks() {
     });
   };
 
-  // 형광펜 (캔버스 영역)
+  // 자유영역 형광펜
   const handleCanvasMouseDown = (pageNum) => (e) => {
     if (isEraseMode) {
-      // 캔버스 형광펜 지우개
       eraseHighlightAtPoint(pageNum, e);
       return;
     }
 
-    // 🔤 글자 형광펜 모드일 때는 textLayer에서 처리
+    // 글자 형광펜 모드는 textLayer에서만 처리
     if (isTextHighlightMode) {
       return;
     }
 
-    // 자유 형광펜 모드
     if (!isHighlightMode || !fileName) return;
 
     const canvas = canvasRefs.current[pageNum - 1];
@@ -1522,7 +1383,7 @@ export default function PdfViewerWithBookmarks() {
       setHighlights((prev) => [
         ...prev,
         {
-          id: `${fileName}-${page}-${Date.now()}-${Math.random()}`,
+          id: `${fileName}-${page}-${createdAt}-${Math.random()}`,
           fileName,
           page,
           x: minX,
@@ -1531,6 +1392,7 @@ export default function PdfViewerWithBookmarks() {
           height,
           color: DEFAULT_HIGHLIGHT_COLOR,
           createdAt,
+          type: "free",
         },
       ]);
     };
@@ -1538,189 +1400,89 @@ export default function PdfViewerWithBookmarks() {
     window.addEventListener("mouseup", onMouseUp);
   };
 
-  // 🔤 글자 형광펜 + 글자 지우개
+  // 글자 형광펜: 텍스트 드래그 → Range.getClientRects() → 캔버스에 사각형
   const handleTextLayerMouseUp = (pageNum) => (e) => {
     const container = textLayerRefs.current[pageNum - 1];
     if (!container || !fileName) return;
 
-    // =========================
-    // 1) 지우개 모드: 캔버스 + 글자 형광펜 모두 지우기
-    // =========================
+    const selection = window.getSelection();
+    if (!selection) return;
+
+    // 지우개 모드: 텍스트 위에서 클릭해도 캔버스 형광펜만 삭제
     if (isEraseMode) {
-      // 1-1) 먼저 이 위치의 캔버스 형광펜 지우기
       eraseHighlightAtPoint(pageNum, e);
-
-      // 1-2) 이어서 이 위치의 글자 형광펜 지우기
-      const selection = window.getSelection();
-      if (!selection || selection.rangeCount === 0) return;
-
-      const range = selection.getRangeAt(0);
-
-      // 선택/커서가 이 페이지의 textLayer 안이 아니면 텍스트 형광펜 지우기만 스킵
-      if (!container.contains(range.commonAncestorContainer)) {
-        selection.removeAllRanges();
-        return;
-      }
-
-      const spans = Array.from(
-        container.querySelectorAll("span[data-span-index]")
-      );
-
-      let eraseInfo = null;
-
-      for (const span of spans) {
-        if (!span.contains(range.startContainer)) continue;
-
-        const fullText = span.textContent || "";
-        if (!fullText) continue;
-
-        const spanIndexStr = span.dataset.spanIndex;
-        if (spanIndexStr == null) continue;
-        const spanIndex = Number(spanIndexStr);
-        if (Number.isNaN(spanIndex)) continue;
-
-        const charIdx = getCharIndexInSpan(
-          span,
-          range.startContainer,
-          range.startOffset
-        );
-
-        eraseInfo = { spanIndex, charIdx };
-        break;
-      }
-
-      if (eraseInfo) {
-        const { spanIndex, charIdx } = eraseInfo;
-        setTextHighlights((prev) => {
-          const next = [...prev];
-          for (let i = next.length - 1; i >= 0; i--) {
-            const h = next[i];
-            if (
-              h.fileName === fileName &&
-              h.page === pageNum &&
-              h.spanIndex === spanIndex &&
-              charIdx >= h.start &&
-              charIdx < h.end
-            ) {
-              next.splice(i, 1);
-              break;
-            }
-          }
-          return next;
-        });
-      }
-
       selection.removeAllRanges();
       return;
     }
 
-    // =========================
-    // 2) 글자 형광펜 모드: 드래그한 범위에 형광펜 추가
-    // =========================
     if (!isTextHighlightMode) {
       return;
     }
 
-    const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0) return;
+    if (selection.rangeCount === 0) return;
 
     const range = selection.getRangeAt(0);
-    // 선택/커서가 이 페이지의 textLayer 안이 아니면 무시
+
     if (!container.contains(range.commonAncestorContainer)) {
       selection.removeAllRanges();
       return;
     }
 
     if (selection.isCollapsed) {
-      // 드래그 없이 클릭만 했으면 형광펜 추가 안 함
       selection.removeAllRanges();
       return;
     }
 
-    const containerSpans = Array.from(
-      container.querySelectorAll("span[data-span-index]")
-    );
+    const canvas = canvasRefs.current[pageNum - 1];
+    if (!canvas) {
+      selection.removeAllRanges();
+      return;
+    }
 
-    const baseTime = Date.now();
-    let offsetCounter = 0;
+    const canvasRect = canvas.getBoundingClientRect();
+    const rects = Array.from(range.getClientRects());
 
-    setTextHighlights((prev) => {
-      const next = [...prev];
+    const createdAtBase = Date.now();
+    let offset = 0;
+    const newHighlights = [];
 
-      containerSpans.forEach((span) => {
-        const spanRange = document.createRange();
-        spanRange.selectNodeContents(span);
+    rects.forEach((rect) => {
+      const left = Math.max(rect.left, canvasRect.left);
+      const right = Math.min(rect.right, canvasRect.right);
+      const top = Math.max(rect.top, canvasRect.top);
+      const bottom = Math.min(rect.bottom, canvasRect.bottom);
 
-        let intersects = false;
-        if (typeof range.intersectsNode === "function") {
-          try {
-            intersects = range.intersectsNode(span);
-          } catch {
-            intersects = false;
-          }
-        } else {
-          const endBeforeStart =
-            range.compareBoundaryPoints(Range.END_TO_START, spanRange) <= 0;
-          const startAfterEnd =
-            range.compareBoundaryPoints(Range.START_TO_END, spanRange) >= 0;
-          intersects = !(endBeforeStart || startAfterEnd);
-        }
+      const widthPx = right - left;
+      const heightPx = bottom - top;
+      if (widthPx <= 0 || heightPx <= 0) return;
 
-        if (!intersects) return;
+      const xNorm = (left - canvasRect.left) / canvasRect.width;
+      const yNorm = (top - canvasRect.top) / canvasRect.height;
+      const wNorm = widthPx / canvasRect.width;
+      const hNorm = heightPx / canvasRect.height;
 
-        const fullText = span.textContent || "";
-        if (!fullText) return;
+      const MIN_WIDTH = 0.005;
+      const MIN_HEIGHT = 0.005;
+      if (wNorm < MIN_WIDTH || hNorm < MIN_HEIGHT) return;
 
-        let start = 0;
-        let end = fullText.length;
-
-        if (span.contains(range.startContainer)) {
-          start = getCharIndexInSpan(
-            span,
-            range.startContainer,
-            range.startOffset
-          );
-        }
-        if (span.contains(range.endContainer)) {
-          end = getCharIndexInSpan(span, range.endContainer, range.endOffset);
-        }
-
-        start = Math.max(0, Math.min(start, fullText.length));
-        end = Math.max(start, Math.min(end, fullText.length));
-        if (start === end) return;
-
-        const spanIndexStr = span.dataset.spanIndex;
-        if (spanIndexStr == null) return;
-        const spanIndex = Number(spanIndexStr);
-        if (Number.isNaN(spanIndex)) return;
-
-        const exists = next.some(
-          (h) =>
-            h.fileName === fileName &&
-            h.page === pageNum &&
-            h.spanIndex === spanIndex &&
-            h.start === start &&
-            h.end === end
-        );
-        if (exists) return;
-
-        const createdAt = baseTime + offsetCounter;
-        offsetCounter += 1;
-
-        next.push({
-          id: `${fileName}-${pageNum}-${spanIndex}-${start}-${end}-${createdAt}-${Math.random()}`,
-          fileName,
-          page: pageNum,
-          spanIndex,
-          start,
-          end,
-          color: DEFAULT_HIGHLIGHT_COLOR,
-          createdAt,
-        });
+      const createdAt = createdAtBase + offset++;
+      newHighlights.push({
+        id: `${fileName}-${pageNum}-${createdAt}-${Math.random()}`,
+        fileName,
+        page: pageNum,
+        x: xNorm,
+        y: yNorm,
+        width: wNorm,
+        height: hNorm,
+        color: DEFAULT_HIGHLIGHT_COLOR,
+        createdAt,
+        type: "text",
       });
-
-      return next;
     });
+
+    if (newHighlights.length > 0) {
+      setHighlights((prev) => [...prev, ...newHighlights]);
+    }
 
     selection.removeAllRanges();
   };
@@ -1731,6 +1493,10 @@ export default function PdfViewerWithBookmarks() {
     if (!q || pageTexts.length === 0) {
       setSearchMatches([]);
       setSearchIndex(0);
+
+      for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+        applySearchHighlightForPage(pageNum);
+      }
       return;
     }
 
@@ -1760,14 +1526,17 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
-  // 검색어 지워지면 기존 하이라이트 제거
+  // 검색어 변경 시 DOM 원복
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
-    if (searchQuery.trim() === "" && searchMatches.length > 0) {
+    if (searchQuery.trim() === "") {
       setSearchMatches([]);
       setSearchIndex(0);
+      for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+        applySearchHighlightForPage(pageNum);
+      }
     }
-  }, [searchQuery, searchMatches.length, pdf, totalPages]);
+  }, [searchQuery, pdf, totalPages]);
 
   const gotoMatch = (nextIndex) => {
     if (searchMatches.length === 0) return;
@@ -1779,8 +1548,6 @@ export default function PdfViewerWithBookmarks() {
   };
 
   const hasSearchResults = searchMatches.length > 0;
-
-  // ✅ 상단 ToolBar로 넘길 헬퍼들
   const pdfLoaded = !!pdf;
 
   const handlePrevPage = () => {
@@ -1881,7 +1648,7 @@ export default function PdfViewerWithBookmarks() {
       onDrop={handleDrop}
       onDragEnter={handleDragEnter}
     >
-      {/* 왼쪽 페이지 사이드바 (별도 컴포넌트) */}
+      {/* 왼쪽 페이지 사이드바 */}
       <PageSidebar
         totalPages={totalPages}
         currentPage={currentPage}
@@ -1898,7 +1665,7 @@ export default function PdfViewerWithBookmarks() {
         toggleBookmarkPage={toggleBookmarkPage}
       />
 
-      {/* 중앙 영역: 상단 탭바 + PDF 본문 */}
+      {/* 중앙 영역 */}
       <Center>
         <TabBar>
           {tabs.map((tab) => (
@@ -1926,16 +1693,14 @@ export default function PdfViewerWithBookmarks() {
           ))}
         </TabBar>
 
-        {/* 중앙 본문 */}
         <Main
           ref={mainRef}
           onScroll={handleScroll}
           onWheel={handleWheel}
-          $freeHighlight={isHighlightMode} // 자유 영역 형광펜
-          $textHighlight={isTextHighlightMode} // 글자 형광펜
-          $erase={isEraseMode} // 지우개
+          $freeHighlight={isHighlightMode}
+          $textHighlight={isTextHighlightMode}
+          $erase={isEraseMode}
         >
-          {/* ✅ 상단 툴바를 별도 컴포넌트로 분리 */}
           <PdfToolbar
             ref={toolbarRef}
             pdfLoaded={pdfLoaded}
@@ -1990,13 +1755,11 @@ export default function PdfViewerWithBookmarks() {
                       $textHighlight={isTextHighlightMode}
                       $erase={isEraseMode}
                     />
-                    {/* ✅ 형광펜 캔버스 */}
                     <HighlightCanvas
                       ref={(el) => {
                         if (el) highlightCanvasRefs.current[i] = el;
                       }}
                     />
-                    {/* 텍스트 레이어 */}
                     <div
                       ref={(el) => {
                         if (el) textLayerRefs.current[i] = el;
@@ -2024,7 +1787,7 @@ export default function PdfViewerWithBookmarks() {
         </Main>
       </Center>
 
-      {/* 오른쪽 즐겨찾기 사이드바 컴포넌트 */}
+      {/* 오른쪽 즐겨찾기 사이드바 */}
       <BookmarkSidebar
         bookmarks={bookmarks}
         setBookmarks={setBookmarks}
@@ -2033,6 +1796,7 @@ export default function PdfViewerWithBookmarks() {
     </Container>
   );
 }
+
 
 // import { useState, useEffect, useRef } from "react";
 // import styled from "styled-components";
