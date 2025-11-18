@@ -1,5 +1,5 @@
 // PageSidebar.jsx
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useMemo, useState } from "react";
 import styled from "styled-components";
 import offSvg from "../svg/off.svg";
 import onSvg from "../svg/on.svg";
@@ -110,6 +110,9 @@ export default function PageSidebar({
   const sidebarRef = useRef(null);
   const thumbnailRefs = useRef([]);
 
+  // 🔹 현재 사이드바에서 "실제로 화면에 보이는 페이지 번호들"
+  const [visiblePages, setVisiblePages] = useState(new Set());
+
   // 해당 페이지가 즐겨찾기인지 여부
   const isPageBookmarked = (pageNum) => {
     if (!fileName) return false;
@@ -142,8 +145,8 @@ export default function PageSidebar({
     setShowOnlyBookmarked((prev) => !prev);
   };
 
-  // 썸네일에 표시할 페이지 목록 계산
-  const getThumbnailPages = () => {
+  // 썸네일에 표시할 페이지 목록 계산 (useMemo로 최적화)
+  const thumbnailPages = useMemo(() => {
     if (!totalPages) return [];
     let pages = Array.from({ length: totalPages }, (_, i) => i + 1);
 
@@ -158,7 +161,7 @@ export default function PageSidebar({
 
     filtered.sort((a, b) => a - b);
     return filtered;
-  };
+  }, [totalPages, showOnlyBookmarked, fileName, bookmarks]);
 
   // 현재 페이지로 썸네일 자동 스크롤
   useEffect(() => {
@@ -185,6 +188,43 @@ export default function PageSidebar({
     });
   }, [currentPage, totalPages]);
 
+  // 🔹 IntersectionObserver로 "보이는 썸네일만 이미지 렌더"하기
+  useEffect(() => {
+    if (!sidebarRef.current) return;
+    const container = sidebarRef.current;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setVisiblePages((prev) => {
+          const next = new Set(prev);
+          entries.forEach((entry) => {
+            const page = Number(entry.target.dataset.page);
+            if (!page) return;
+            if (entry.isIntersecting) {
+              next.add(page);
+            } else {
+              next.delete(page);
+            }
+          });
+          return next;
+        });
+      },
+      {
+        root: container,
+        threshold: 0.1,
+      }
+    );
+
+    thumbnailRefs.current.forEach((el) => {
+      if (el) observer.observe(el);
+    });
+
+    return () => {
+      observer.disconnect();
+    };
+    // thumbnailPages 길이나 필터링 상태가 바뀔 때만 재설정
+  }, [thumbnailPages.length, showOnlyBookmarked, fileName]);
+
   // 접힌 상태
   if (isLeftCollapsed) {
     return (
@@ -195,6 +235,9 @@ export default function PageSidebar({
   }
 
   // 펼친 상태
+  // 🔹 렌더 시작 전에 refs 초기화해서 stale ref 방지
+  thumbnailRefs.current = [];
+
   return (
     <Sidebar ref={sidebarRef} onWheel={handleSidebarWheel}>
       <SidebarHeader>
@@ -254,14 +297,16 @@ export default function PageSidebar({
       </SidebarHeader>
 
       <ThumbnailsContainer>
-        {getThumbnailPages().map((pageNum) => {
+        {thumbnailPages.map((pageNum) => {
           const idx = pageNum - 1;
           const src = thumbnails[idx];
           const bookmarked = isPageBookmarked(pageNum);
+          const isVisible = visiblePages.has(pageNum);
 
           return (
             <PageThumbnail
               key={pageNum}
+              data-page={pageNum}
               ref={(el) => {
                 thumbnailRefs.current[idx] = el;
               }}
@@ -281,7 +326,7 @@ export default function PageSidebar({
                 />
               </ThumbnailIconButton>
 
-              {src ? (
+              {src && isVisible ? (
                 <img src={src} alt={`Page ${pageNum}`} />
               ) : (
                 <div

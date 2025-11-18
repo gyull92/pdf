@@ -93,18 +93,6 @@ const BookmarkHeaderTopRow = styled.div`
   gap: 8px;
 `;
 
-const BookmarkFileName = styled.span`
-  width: 190px;
-  font-size: 11px;
-  color: #333;
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  word-break: break-all;
-`;
-
 const BookmarkMiddleRow = styled.div`
   display: flex;
   align-items: center;
@@ -864,8 +852,9 @@ export default function BookmarkSidebar({
     });
   };
 
-  // 🔹 리스트(FolderBookmarkList / '폴더 없음' 리스트) 위로 드롭 → 정확한 위치 계산해서 재정렬
-  const handleBookmarkDropInList = (e, visibleKeys) => {
+  // 🔹 리스트(FolderBookmarkList / '폴더 없음' 리스트) 위로 드롭
+  //    → 같은 폴더 안이면 순서 변경, 다른 폴더에서 온 거면 폴더 이동
+  const handleBookmarkDropInList = (e, visibleKeys, bucketFolderId) => {
     e.preventDefault();
     e.stopPropagation();
 
@@ -885,6 +874,31 @@ export default function BookmarkSidebar({
 
     if (!keys || keys.length === 0) return;
 
+    // ✅ 1단계: 이 드롭이 "폴더 변경"인지, "같은 폴더 내 순서 변경"인지 판별
+    if (bucketFolderId !== undefined) {
+      const targetFolderId = bucketFolderId || null;
+
+      const allAlreadyInBucket = keys.every((k) => {
+        const bm = bookmarks.find((b) => b.key === k);
+        if (!bm) return false;
+        const currentFolderId = bm.folderId || null;
+        return currentFolderId === targetFolderId;
+      });
+
+      // 👉 하나라도 다른 폴더에 속해 있으면 폴더 이동으로 처리
+      if (!allAlreadyInBucket) {
+        if (targetFolderId === null) {
+          // '폴더 없음' 리스트에 드롭
+          handleBookmarkDropOnUnassignedContainer(e);
+        } else {
+          // 특정 폴더 리스트에 드롭
+          handleBookmarkDropOnFolderContainer(e, targetFolderId);
+        }
+        return;
+      }
+    }
+
+    // ✅ 2단계: 여기부터는 "같은 폴더 안에서 순서 변경"일 때만 실행
     const container = e.currentTarget;
     const itemElements = Array.from(
       container.querySelectorAll("[data-bm-key]")
@@ -901,7 +915,6 @@ export default function BookmarkSidebar({
       const key = el.getAttribute("data-bm-key");
       const rect = el.getBoundingClientRect();
 
-      // 마우스가 이 아이템 위 영역(사이 공간 포함)에 있는 경우
       if (mouseY < rect.top) {
         targetKey = key;
         position = "before";
@@ -1108,9 +1121,13 @@ export default function BookmarkSidebar({
                             e.dataTransfer.dropEffect = "move";
                           }
                         }}
-                        // 리스트 영역에 드롭 → 정확한 위치로 순서 변경
+                        // 리스트 영역에 드롭 → 정확한 위치로 순서 변경 or 다른 폴더에서 온 경우 폴더 이동
                         onDrop={(e) =>
-                          handleBookmarkDropInList(e, folderBookmarkKeys)
+                          handleBookmarkDropInList(
+                            e,
+                            folderBookmarkKeys,
+                            folder.id
+                          )
                         }
                       >
                         {folderBookmarks.length === 0 ? (
@@ -1177,9 +1194,6 @@ export default function BookmarkSidebar({
                                     {bm.page}p
                                   </BookmarkPageText>
                                 </BookmarkHeaderTopRow>
-                                <BookmarkFileName title={bm.fileName}>
-                                  {bm.fileName}
-                                </BookmarkFileName>
                                 <BookmarkMiddleRow />
                               </BookmarkItem>
                             );
@@ -1219,8 +1233,10 @@ export default function BookmarkSidebar({
                     e.dataTransfer.dropEffect = "move";
                   }
                 }}
-                // 리스트 영역에 드롭 → '폴더 없음' 내에서 순서 변경
-                onDrop={(e) => handleBookmarkDropInList(e, unassignedKeys)}
+                // 리스트 영역에 드롭 → '폴더 없음' 내에서 순서 변경 or 다른 폴더에서 온 경우 폴더 없음으로 이동
+                onDrop={(e) =>
+                  handleBookmarkDropInList(e, unassignedKeys, null)
+                }
               >
                 {unassignedBookmarks.length === 0 ? (
                   <EmptyFolderText>
@@ -1274,9 +1290,6 @@ export default function BookmarkSidebar({
 
                             <BookmarkPageText>{bm.page}p</BookmarkPageText>
                           </BookmarkHeaderTopRow>
-                          <BookmarkFileName title={bm.fileName}>
-                            {bm.fileName}
-                          </BookmarkFileName>
                         </BookmarkHeader>
 
                         <BookmarkMiddleRow />
