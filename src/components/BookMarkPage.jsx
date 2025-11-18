@@ -1,6 +1,17 @@
 import { useState, useEffect, useRef } from "react";
 import styled from "styled-components";
 
+// ✅ Electron ipcRenderer (폴더/순서 영구 저장용, 없으면 조용히 패스)
+let ipcRenderer = null;
+if (typeof window !== "undefined" && window.require) {
+  try {
+    const electron = window.require("electron");
+    ipcRenderer = electron.ipcRenderer;
+  } catch (e) {
+    console.warn("ipcRenderer 로드 실패(BookMarkPage):", e);
+  }
+}
+
 const RightCollapsedTab = styled.div`
   width: 24px;
   background: #f0f0f0;
@@ -87,11 +98,11 @@ const BookmarkFileName = styled.span`
   font-size: 11px;
   color: #333;
   display: -webkit-box;
-  -webkit-line-clamp: 1; /* 최대 1줄 */
+  -webkit-line-clamp: 1;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis; /* 1줄 넘으면 ... 처리 */
-  word-break: break-all; /* 칸 좁을 때 단어 중간이라도 줄바꿈 */
+  text-overflow: ellipsis;
+  word-break: break-all;
 `;
 
 const BookmarkMiddleRow = styled.div`
@@ -268,13 +279,11 @@ const DialogButton = styled.button`
   }
 `;
 
-// 자동 라벨 / 커스텀 라벨 처리 헬퍼
-const getBookmarkDisplayLabel = (label, idx) => {
-  const trimmed = (label || "").trim();
-  if (!trimmed) {
-    return `즐겨찾기${idx + 1}`;
-  }
-  return trimmed;
+// 🔹 라벨 표시 텍스트: index 안 쓰고, 객체 안 label만 사용
+const getBookmarkDisplayLabel = (bm) => {
+  const trimmed = (bm.label || "").trim();
+  if (trimmed) return trimmed;
+  return "즐겨찾기";
 };
 
 export default function BookmarkSidebar({
@@ -318,14 +327,39 @@ export default function BookmarkSidebar({
     value: "",
   });
 
-  // 폴더 로컬스토리지 로드/저장
+  // 🔹 폴더 로딩 (localStorage → electron 파일 순)
   useEffect(() => {
     const savedFolders = localStorage.getItem("gyul-pdf-folders");
-    if (savedFolders) setFolders(JSON.parse(savedFolders));
+    if (savedFolders) {
+      try {
+        setFolders(JSON.parse(savedFolders));
+      } catch (e) {
+        console.warn("localStorage 폴더 파싱 실패:", e);
+      }
+    }
+
+    (async () => {
+      if (!ipcRenderer) return;
+      try {
+        const fileFolders = await ipcRenderer.invoke("load-folders");
+        if (Array.isArray(fileFolders) && fileFolders.length > 0) {
+          setFolders(fileFolders);
+        }
+      } catch (e) {
+        console.warn("폴더 파일 로드 실패:", e);
+      }
+    })();
   }, []);
 
+  // 🔹 폴더 저장
   useEffect(() => {
-    localStorage.setItem("gyul-pdf-folders", JSON.stringify(folders));
+    try {
+      localStorage.setItem("gyul-pdf-folders", JSON.stringify(folders));
+    } catch (e) {}
+
+    if (ipcRenderer) {
+      ipcRenderer.send("save-folders", folders);
+    }
   }, [folders]);
 
   // 오른쪽 사이드바 리사이즈
@@ -386,7 +420,7 @@ export default function BookmarkSidebar({
     };
   }, []);
 
-  // 폴더 관련
+  // 🔹 폴더 관련
   const handleAddFolder = () => {
     setFolders((prev) => {
       const nextIndex = prev.length + 1;
@@ -492,16 +526,10 @@ export default function BookmarkSidebar({
     setBookmarks((prev) => prev.filter((b) => b.key !== key));
   };
 
-  // 텍스트용 인덱스 맵
-  const indexMap = {};
-  bookmarks.forEach((bm, idx) => {
-    indexMap[bm.key] = idx;
-  });
-
   const unassignedBookmarks = bookmarks.filter((bm) => !bm.folderId);
   const unassignedKeys = unassignedBookmarks.map((b) => b.key);
 
-  // 컨텍스트 메뉴 핸들러
+  // 🔹 컨텍스트 메뉴 핸들러
   const handleFolderContextMenu = (e, folder) => {
     e.preventDefault();
     e.stopPropagation();
@@ -580,7 +608,7 @@ export default function BookmarkSidebar({
     if (!contextMenu.target) return;
     const bm = bookmarks.find((b) => b.key === contextMenu.target.key);
     if (bm) {
-      const displayLabel = getBookmarkDisplayLabel(bm.label, indexMap[bm.key]);
+      const displayLabel = getBookmarkDisplayLabel(bm);
       startEditBookmark(bm, displayLabel);
     }
     closeContextMenu();
@@ -643,7 +671,7 @@ export default function BookmarkSidebar({
     closeContextMenu();
   };
 
-  // 즐겨찾기 클릭(단일/다중/범위 선택)
+  // 🔹 즐겨찾기 클릭(단일/다중/범위 선택)
   const handleBookmarkClick = (e, bm, visibleKeys) => {
     e.stopPropagation();
 
@@ -688,7 +716,7 @@ export default function BookmarkSidebar({
     setLastSelectedBookmarkKey(bm.key);
   };
 
-  // 즐겨찾기 드래그
+  // 🔹 즐겨찾기 드래그 시작
   const handleBookmarkDragStart = (e, bm) => {
     let keysToDrag = selectedBookmarkKeys.includes(bm.key)
       ? selectedBookmarkKeys
@@ -711,8 +739,37 @@ export default function BookmarkSidebar({
     setDraggingBookmarkKeys([]);
   };
 
-  // 폴더로 드롭했을 때 즐겨찾기 이동
-  const handleBookmarkDropOnFolder = (e, folderId) => {
+  // 🔹 '폴더 없음'으로 드롭했을 때 폴더 해제
+  const handleBookmarkDropOnUnassignedContainer = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    let keys = draggingBookmarkKeys;
+
+    if ((!keys || keys.length === 0) && e.dataTransfer) {
+      const data = e.dataTransfer.getData("text/plain");
+      if (data) {
+        try {
+          keys = JSON.parse(data);
+        } catch (err) {
+          keys = [];
+        }
+      }
+    }
+
+    if (!keys || keys.length === 0) return;
+
+    setBookmarks((prev) =>
+      prev.map((bm) =>
+        keys.includes(bm.key) ? { ...bm, folderId: null } : bm
+      )
+    );
+
+    setDraggingBookmarkKeys([]);
+  };
+
+  // 🔹 폴더 전체 영역에 드롭 → 해당 폴더로 이동 (순서는 맨 끝)
+  const handleBookmarkDropOnFolderContainer = (e, folderId) => {
     e.preventDefault();
     e.stopPropagation();
 
@@ -738,8 +795,77 @@ export default function BookmarkSidebar({
     setDraggingBookmarkKeys([]);
   };
 
-  // '폴더 없음'으로 드롭했을 때 폴더 해제
-  const handleBookmarkDropOnUnassigned = (e) => {
+  // 🔹 같은 그룹(폴더 / 폴더 없음) 안에서 순서 변경
+  const reorderBookmarksGlobally = (
+    draggedKeys,
+    targetKey,
+    visibleKeys,
+    position = "before" // 'before' | 'after'
+  ) => {
+    setBookmarks((prev) => {
+      if (!prev || prev.length === 0) return prev;
+
+      const keyToBookmark = {};
+      prev.forEach((bm) => {
+        keyToBookmark[bm.key] = bm;
+      });
+
+      const bucketKeys =
+        Array.isArray(visibleKeys) && visibleKeys.length > 0
+          ? visibleKeys.filter((k) => keyToBookmark[k])
+          : prev.map((bm) => bm.key);
+
+      if (bucketKeys.length === 0) return prev;
+
+      const draggedInBucket = draggedKeys.filter(
+        (k) =>
+          bucketKeys.includes(k) &&
+          keyToBookmark[k] &&
+          k !== targetKey // 자기 자신 위로 드롭 시 무시
+      );
+      if (draggedInBucket.length === 0) return prev;
+
+      if (!bucketKeys.includes(targetKey)) return prev;
+
+      const remaining = bucketKeys.filter(
+        (k) => !draggedInBucket.includes(k)
+      );
+
+      let insertIndex = remaining.indexOf(targetKey);
+      if (insertIndex === -1) return prev;
+
+      if (position === "after") {
+        insertIndex += 1;
+      }
+
+      const newBucketKeys = [
+        ...remaining.slice(0, insertIndex),
+        ...draggedInBucket,
+        ...remaining.slice(insertIndex),
+      ];
+
+      const bucketKeySet = new Set(bucketKeys);
+      const newList = [];
+      let bucketPos = 0;
+
+      prev.forEach((bm) => {
+        if (!bucketKeySet.has(bm.key)) {
+          newList.push(bm);
+        } else {
+          const k = newBucketKeys[bucketPos++];
+          const mapped = keyToBookmark[k];
+          if (mapped) {
+            newList.push(mapped);
+          }
+        }
+      });
+
+      return newList;
+    });
+  };
+
+  // 🔹 리스트(FolderBookmarkList / '폴더 없음' 리스트) 위로 드롭 → 정확한 위치 계산해서 재정렬
+  const handleBookmarkDropInList = (e, visibleKeys) => {
     e.preventDefault();
     e.stopPropagation();
 
@@ -749,8 +875,9 @@ export default function BookmarkSidebar({
       const data = e.dataTransfer.getData("text/plain");
       if (data) {
         try {
-          keys = JSON.parse(data);
-        } catch (err) {
+          const parsed = JSON.parse(data);
+          if (Array.isArray(parsed)) keys = parsed;
+        } catch {
           keys = [];
         }
       }
@@ -758,10 +885,50 @@ export default function BookmarkSidebar({
 
     if (!keys || keys.length === 0) return;
 
-    setBookmarks((prev) =>
-      prev.map((bm) => (keys.includes(bm.key) ? { ...bm, folderId: null } : bm))
+    const container = e.currentTarget;
+    const itemElements = Array.from(
+      container.querySelectorAll("[data-bm-key]")
     );
+    if (itemElements.length === 0) return;
 
+    const mouseY = e.clientY;
+
+    let targetKey = null;
+    let position = "after";
+
+    for (let i = 0; i < itemElements.length; i++) {
+      const el = itemElements[i];
+      const key = el.getAttribute("data-bm-key");
+      const rect = el.getBoundingClientRect();
+
+      // 마우스가 이 아이템 위 영역(사이 공간 포함)에 있는 경우
+      if (mouseY < rect.top) {
+        targetKey = key;
+        position = "before";
+        break;
+      }
+
+      if (mouseY >= rect.top && mouseY <= rect.bottom) {
+        const middleY = rect.top + rect.height / 2;
+        if (mouseY < middleY) {
+          targetKey = key;
+          position = "before";
+        } else {
+          targetKey = key;
+          position = "after";
+        }
+        break;
+      }
+    }
+
+    // 모든 아이템 아래쪽에 떨어졌다면 → 마지막 아이템 뒤로
+    if (!targetKey) {
+      const lastEl = itemElements[itemElements.length - 1];
+      targetKey = lastEl.getAttribute("data-bm-key");
+      position = "after";
+    }
+
+    reorderBookmarksGlobally(keys, targetKey, visibleKeys, position);
     setDraggingBookmarkKeys([]);
   };
 
@@ -843,7 +1010,10 @@ export default function BookmarkSidebar({
                         e.dataTransfer.dropEffect = "move";
                       }
                     }}
-                    onDrop={(e) => handleBookmarkDropOnFolder(e, folder.id)}
+                    // 폴더 헤더나 빈 영역에 드롭 → 폴더 이동(맨 뒤)
+                    onDrop={(e) =>
+                      handleBookmarkDropOnFolderContainer(e, folder.id)
+                    }
                   >
                     <FolderTitleRow>
                       <div
@@ -931,17 +1101,25 @@ export default function BookmarkSidebar({
                     </FolderTitleRow>
 
                     {!isFolderCollapsed && (
-                      <FolderBookmarkList>
+                      <FolderBookmarkList
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          if (e.dataTransfer) {
+                            e.dataTransfer.dropEffect = "move";
+                          }
+                        }}
+                        // 리스트 영역에 드롭 → 정확한 위치로 순서 변경
+                        onDrop={(e) =>
+                          handleBookmarkDropInList(e, folderBookmarkKeys)
+                        }
+                      >
                         {folderBookmarks.length === 0 ? (
                           <EmptyFolderText>
                             이 폴더에 즐겨찾기가 없습니다.
                           </EmptyFolderText>
                         ) : (
                           folderBookmarks.map((bm) => {
-                            const displayLabel = getBookmarkDisplayLabel(
-                              bm.label,
-                              indexMap[bm.key]
-                            );
+                            const displayLabel = getBookmarkDisplayLabel(bm);
                             const selected = selectedBookmarkKeys.includes(
                               bm.key
                             );
@@ -949,10 +1127,15 @@ export default function BookmarkSidebar({
                             return (
                               <BookmarkItem
                                 key={bm.key}
+                                data-bm-key={bm.key} // ✅ 리스트 계산용
                                 $selected={selected}
                                 draggable
                                 onClick={(e) =>
-                                  handleBookmarkClick(e, bm, folderBookmarkKeys)
+                                  handleBookmarkClick(
+                                    e,
+                                    bm,
+                                    folderBookmarkKeys
+                                  )
                                 }
                                 onDragStart={(e) =>
                                   handleBookmarkDragStart(e, bm)
@@ -1018,7 +1201,8 @@ export default function BookmarkSidebar({
                   e.dataTransfer.dropEffect = "move";
                 }
               }}
-              onDrop={handleBookmarkDropOnUnassigned}
+              // 컨테이너(제목, 빈 영역)에 드롭 → '폴더 없음'으로 이동
+              onDrop={handleBookmarkDropOnUnassignedContainer}
               style={{
                 marginTop: 8,
                 paddingBottom: 8,
@@ -1028,21 +1212,28 @@ export default function BookmarkSidebar({
                 📌 폴더 없음
               </h4>
 
-              <FolderBookmarkList>
+              <FolderBookmarkList
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  if (e.dataTransfer) {
+                    e.dataTransfer.dropEffect = "move";
+                  }
+                }}
+                // 리스트 영역에 드롭 → '폴더 없음' 내에서 순서 변경
+                onDrop={(e) => handleBookmarkDropInList(e, unassignedKeys)}
+              >
                 {unassignedBookmarks.length === 0 ? (
                   <EmptyFolderText>
                     이 영역에 드롭하면 ‘폴더 없음’으로 이동합니다.
                   </EmptyFolderText>
                 ) : (
                   unassignedBookmarks.map((bm) => {
-                    const displayLabel = getBookmarkDisplayLabel(
-                      bm.label,
-                      indexMap[bm.key]
-                    );
+                    const displayLabel = getBookmarkDisplayLabel(bm);
                     const selected = selectedBookmarkKeys.includes(bm.key);
                     return (
                       <BookmarkItem
                         key={bm.key}
+                        data-bm-key={bm.key} // ✅ 리스트 계산용
                         $selected={selected}
                         draggable
                         onClick={(e) =>

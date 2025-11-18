@@ -274,66 +274,51 @@ export default function PdfViewerWithBookmarks() {
     currentPageRef.current = currentPage;
   }, [currentPage]);
 
-  // 🔹 전역 드래그앤드롭 (파일 드래그에만 반응)
+  // 🔹 북마크/형광펜 로드 (localStorage 우선, 그다음 파일에서 로드하되 "데이터가 있을 때만" 덮어쓰기)
   useEffect(() => {
-    const handleWindowDragOver = (e) => {
-      if (!isFileDragEvent(e)) return;
-      e.preventDefault();
-      if (e.dataTransfer) {
-        e.dataTransfer.dropEffect = "copy";
+    // 1) localStorage 에서 먼저 로드
+    let hasLocalBookmarks = false;
+
+    try {
+      const savedLocalBookmarks = localStorage.getItem("gyul-pdf-bookmarks");
+      if (savedLocalBookmarks) {
+        const parsed = JSON.parse(savedLocalBookmarks);
+        if (Array.isArray(parsed)) {
+          setBookmarks(parsed);
+          hasLocalBookmarks = parsed.length > 0;
+        }
       }
-      setIsDragOver(true);
-    };
-
-    const handleWindowDragLeave = (e) => {
-      if (!isFileDragEvent(e)) return;
-      e.preventDefault();
-      setIsDragOver(false);
-    };
-
-    const handleWindowDrop = (e) => {
-      if (!isFileDragEvent(e)) return;
-      e.preventDefault();
-      setIsDragOver(false);
-    };
-
-    window.addEventListener("dragover", handleWindowDragOver);
-    window.addEventListener("dragleave", handleWindowDragLeave);
-    window.addEventListener("drop", handleWindowDrop);
-
-    return () => {
-      window.removeEventListener("dragover", handleWindowDragOver);
-      window.removeEventListener("dragleave", handleWindowDragLeave);
-      window.removeEventListener("drop", handleWindowDrop);
-    };
-  }, []);
-
-  // 북마크/형광펜 로드
-  useEffect(() => {
-    const savedLocalBookmarks = localStorage.getItem("gyul-pdf-bookmarks");
-    if (savedLocalBookmarks) {
-      try {
-        setBookmarks(JSON.parse(savedLocalBookmarks));
-      } catch (e) {
-        console.warn("localStorage 북마크 파싱 실패:", e);
-      }
+    } catch (e) {
+      console.warn("localStorage 북마크 파싱 실패:", e);
     }
 
-    const savedHighlights = localStorage.getItem("gyul-pdf-highlights");
-    if (savedHighlights) {
-      try {
-        setHighlights(JSON.parse(savedHighlights));
-      } catch (e) {
-        console.warn("localStorage 하이라이트 파싱 실패:", e);
+    try {
+      const savedHighlights = localStorage.getItem("gyul-pdf-highlights");
+      if (savedHighlights) {
+        const parsed = JSON.parse(savedHighlights);
+        if (Array.isArray(parsed)) {
+          setHighlights(parsed);
+        }
       }
+    } catch (e) {
+      console.warn("localStorage 하이라이트 파싱 실패:", e);
     }
 
+    // 2) IPC를 통해 파일에서 로드
     (async () => {
       if (!ipcRenderer) return;
       try {
         const fileBookmarks = await ipcRenderer.invoke("load-bookmarks");
-        if (Array.isArray(fileBookmarks)) {
+
+        // ✅ 실제로 저장된 북마크가 있을 때만 localStorage 내용을 덮어쓴다.
+        if (Array.isArray(fileBookmarks) && fileBookmarks.length > 0) {
           setBookmarks(fileBookmarks);
+        } else {
+          // fileBookmarks 가 비어 있고, localStorage 에 데이터도 없다면
+          // (즉 완전 첫 실행이라면) 여기서 굳이 setBookmarks([])를 다시 할 필요 없음.
+          if (!hasLocalBookmarks) {
+            // 필요하면 초기값으로 빈 배열을 명시해도 되지만, 이미 useState([])라 생략 가능
+          }
         }
       } catch (e) {
         console.warn("파일에서 북마크 로드 실패:", e);
