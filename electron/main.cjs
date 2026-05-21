@@ -60,8 +60,19 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       nodeIntegration: true, // renderer에서 require('electron') 사용 가능
       contextIsolation: false, // window.electronAPI 안 써도 됨
+      // 🔹 창이 가려져 있거나 최소화되어도 렌더러의 timer/requestAnimationFrame이 정상 동작하도록
+      //    백그라운드 throttling 해제 (PDF 페이지 백그라운드 렌더링용)
+      backgroundThrottling: false,
     },
   });
+
+  // 🔹 보조 보강: 일부 Chromium 정책이 throttling을 다시 켜는 경우를 대비해
+  //    webContents 레벨에서도 명시적으로 false 설정
+  try {
+    mainWindow.webContents.setBackgroundThrottling(false);
+  } catch (_) {
+    /* 일부 버전에서 미지원이면 무시 */
+  }
 
   // 혹시 모를 경우를 위해 한 번 더 확실하게 숨기기
   mainWindow.setMenuBarVisibility(false);
@@ -151,92 +162,101 @@ if (!gotLock) {
 
   // 🔹 renderer에서 "이 경로의 PDF 파일 내용을 읽어줘"라고 요청할 때
   ipcMain.handle("read-pdf-file", async (event, filePath) => {
-    const buffer = await fs.promises.readFile(filePath);
-    return buffer;
+    if (typeof filePath !== "string" || !filePath) {
+      throw new Error("invalid file path");
+    }
+    if (!filePath.toLowerCase().endsWith(".pdf")) {
+      throw new Error("only .pdf files are allowed");
+    }
+    try {
+      const stat = await fs.promises.stat(filePath);
+      if (!stat.isFile()) {
+        throw new Error("not a regular file");
+      }
+    } catch (e) {
+      throw new Error(`PDF 파일을 찾을 수 없습니다: ${e.message}`);
+    }
+    return fs.promises.readFile(filePath);
   });
+
+  // 안전한 JSON 파싱 + 배열 강제
+  function safeReadJsonArray(filePath) {
+    return fs.promises
+      .readFile(filePath, "utf-8")
+      .then((raw) => {
+        try {
+          const data = JSON.parse(raw);
+          return Array.isArray(data) ? data : [];
+        } catch (e) {
+          console.warn(`JSON 파싱 실패(${filePath}):`, e);
+          return [];
+        }
+      })
+      .catch(() => []);
+  }
+
+  // 원자적 파일 쓰기 (임시 파일 → rename) + 직렬화
+  const writeQueues = new Map();
+  function atomicWriteJson(filePath, data) {
+    const prev = writeQueues.get(filePath) || Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        const tmpPath = `${filePath}.tmp-${process.pid}`;
+        try {
+          await fs.promises.writeFile(
+            tmpPath,
+            JSON.stringify(data, null, 2),
+            "utf-8",
+          );
+          await fs.promises.rename(tmpPath, filePath);
+        } catch (e) {
+          console.error(`저장 실패(${filePath}):`, e);
+          try {
+            await fs.promises.unlink(tmpPath);
+          } catch (_) {
+            /* ignore */
+          }
+        }
+      });
+    writeQueues.set(filePath, next);
+    return next;
+  }
 
   // ✅ 🔹 renderer에서 북마크 로드 요청
   ipcMain.handle("load-bookmarks", async () => {
     const persistentPath = getPersistentBookmarksPath();
 
-    // 1) 영구 경로에 이미 파일이 있으면 그걸 사용
     if (fs.existsSync(persistentPath)) {
-      try {
-        const raw = await fs.promises.readFile(persistentPath, "utf-8");
-        return JSON.parse(raw);
-      } catch (e) {
-        console.error("북마크 읽기 실패(영구 경로):", e);
-        return [];
-      }
+      return safeReadJsonArray(persistentPath);
     }
 
-    // 2) 없으면 (한 번만) 옛날 경로에서 가져와서 옮기기
     const legacyPath = getLegacyBookmarksPath();
     if (fs.existsSync(legacyPath)) {
-      try {
-        const raw = await fs.promises.readFile(legacyPath, "utf-8");
-        const data = JSON.parse(raw);
-        await fs.promises.writeFile(
-          persistentPath,
-          JSON.stringify(data, null, 2),
-          "utf-8"
-        );
-        return data;
-      } catch (e) {
-        console.error("북마크 마이그레이션 실패:", e);
-        return [];
-      }
+      const data = await safeReadJsonArray(legacyPath);
+      await atomicWriteJson(persistentPath, data);
+      return data;
     }
 
-    // 3) 둘 다 없으면 빈 배열
     return [];
   });
 
   // ✅ 🔹 renderer에서 북마크 저장 요청
-  ipcMain.on("save-bookmarks", async (event, bookmarks) => {
-    const persistentPath = getPersistentBookmarksPath();
-    try {
-      await fs.promises.writeFile(
-        persistentPath,
-        JSON.stringify(bookmarks, null, 2),
-        "utf-8"
-      );
-    } catch (e) {
-      console.error("북마크 저장 실패:", e);
-    }
+  ipcMain.on("save-bookmarks", (event, bookmarks) => {
+    if (!Array.isArray(bookmarks)) return;
+    atomicWriteJson(getPersistentBookmarksPath(), bookmarks);
   });
 
   // ✅ 🔹 renderer에서 폴더 로드 요청
   ipcMain.handle("load-folders", async () => {
     const foldersPath = getPersistentFoldersPath();
-
-    if (!fs.existsSync(foldersPath)) {
-      return []; // 폴더 정보 없으면 빈 배열
-    }
-
-    try {
-      const raw = await fs.promises.readFile(foldersPath, "utf-8");
-      const data = JSON.parse(raw);
-      // 혹시 배열이 아니면 비우기
-      if (!Array.isArray(data)) return [];
-      return data;
-    } catch (e) {
-      console.error("폴더 읽기 실패:", e);
-      return [];
-    }
+    if (!fs.existsSync(foldersPath)) return [];
+    return safeReadJsonArray(foldersPath);
   });
 
   // ✅ 🔹 renderer에서 폴더 저장 요청
-  ipcMain.on("save-folders", async (event, folders) => {
-    const foldersPath = getPersistentFoldersPath();
-    try {
-      await fs.promises.writeFile(
-        foldersPath,
-        JSON.stringify(folders, null, 2),
-        "utf-8"
-      );
-    } catch (e) {
-      console.error("폴더 저장 실패:", e);
-    }
+  ipcMain.on("save-folders", (event, folders) => {
+    if (!Array.isArray(folders)) return;
+    atomicWriteJson(getPersistentFoldersPath(), folders);
   });
 }

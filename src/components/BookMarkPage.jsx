@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo, memo } from "react";
 import styled from "styled-components";
 
 // ✅ Electron ipcRenderer (폴더/순서 영구 저장용, 없으면 조용히 패스)
@@ -11,6 +11,16 @@ if (typeof window !== "undefined" && window.require) {
     console.warn("ipcRenderer 로드 실패(BookMarkPage):", e);
   }
 }
+
+const safeParseJSON = (raw, fallback = null) => {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("JSON 파싱 실패:", e);
+    return fallback;
+  }
+};
 
 const RightCollapsedTab = styled.div`
   width: 24px;
@@ -274,11 +284,7 @@ const getBookmarkDisplayLabel = (bm) => {
   return "즐겨찾기";
 };
 
-export default function BookmarkSidebar({
-  bookmarks,
-  setBookmarks,
-  goToBookmark,
-}) {
+function BookmarkSidebar({ bookmarks, setBookmarks, goToBookmark }) {
   // 접힘 상태 & 리사이즈
   const [isRightCollapsed, setIsRightCollapsed] = useState(false);
   const [rightSidebarWidth, setRightSidebarWidth] = useState(320);
@@ -317,37 +323,61 @@ export default function BookmarkSidebar({
 
   // 🔹 폴더 로딩 (localStorage → electron 파일 순)
   useEffect(() => {
-    const savedFolders = localStorage.getItem("gyul-pdf-folders");
-    if (savedFolders) {
-      try {
-        setFolders(JSON.parse(savedFolders));
-      } catch (e) {
-        console.warn("localStorage 폴더 파싱 실패:", e);
-      }
+    let cancelled = false;
+
+    try {
+      const parsed = safeParseJSON(
+        localStorage.getItem("gyul-pdf-folders"),
+        null,
+      );
+      if (Array.isArray(parsed)) setFolders(parsed);
+    } catch (e) {
+      console.warn("localStorage 폴더 읽기 실패:", e);
     }
 
     (async () => {
       if (!ipcRenderer) return;
       try {
         const fileFolders = await ipcRenderer.invoke("load-folders");
-        if (Array.isArray(fileFolders) && fileFolders.length > 0) {
+        if (
+          !cancelled &&
+          Array.isArray(fileFolders) &&
+          fileFolders.length > 0
+        ) {
           setFolders(fileFolders);
         }
       } catch (e) {
         console.warn("폴더 파일 로드 실패:", e);
       }
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // 🔹 폴더 저장
+  // 🔹 폴더 저장 (디바운스 + 첫 마운트 스킵)
+  const foldersMountedRef = useRef(false);
   useEffect(() => {
-    try {
-      localStorage.setItem("gyul-pdf-folders", JSON.stringify(folders));
-    } catch (e) {}
-
-    if (ipcRenderer) {
-      ipcRenderer.send("save-folders", folders);
+    if (!foldersMountedRef.current) {
+      foldersMountedRef.current = true;
+      return;
     }
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem("gyul-pdf-folders", JSON.stringify(folders));
+      } catch (e) {
+        console.warn("localStorage 폴더 저장 실패:", e);
+      }
+      if (ipcRenderer) {
+        try {
+          ipcRenderer.send("save-folders", folders);
+        } catch (e) {
+          console.warn("save-folders IPC 실패:", e);
+        }
+      }
+    }, 300);
+    return () => clearTimeout(timer);
   }, [folders]);
 
   // 오른쪽 사이드바 리사이즈
@@ -514,8 +544,25 @@ export default function BookmarkSidebar({
     setBookmarks((prev) => prev.filter((b) => b.key !== key));
   };
 
-  const unassignedBookmarks = bookmarks.filter((bm) => !bm.folderId);
-  const unassignedKeys = unassignedBookmarks.map((b) => b.key);
+  const unassignedBookmarks = useMemo(
+    () => bookmarks.filter((bm) => !bm.folderId),
+    [bookmarks],
+  );
+  const unassignedKeys = useMemo(
+    () => unassignedBookmarks.map((b) => b.key),
+    [unassignedBookmarks],
+  );
+
+  // 폴더별 북마크 미리 그룹화
+  const bookmarksByFolder = useMemo(() => {
+    const map = new Map();
+    for (const bm of bookmarks) {
+      if (!bm.folderId) continue;
+      if (!map.has(bm.folderId)) map.set(bm.folderId, []);
+      map.get(bm.folderId).push(bm);
+    }
+    return map;
+  }, [bookmarks]);
 
   // 🔹 컨텍스트 메뉴 핸들러
   const handleFolderContextMenu = (e, folder) => {
@@ -1007,9 +1054,8 @@ export default function BookmarkSidebar({
 
             <FolderList>
               {folders.map((folder) => {
-                const folderBookmarks = bookmarks.filter(
-                  (bm) => bm.folderId === folder.id
-                );
+                const folderBookmarks =
+                  bookmarksByFolder.get(folder.id) || [];
                 const isFolderCollapsed = collapsedFolders[folder.id];
                 const folderBookmarkKeys = folderBookmarks.map((b) => b.key);
 
@@ -1385,3 +1431,5 @@ export default function BookmarkSidebar({
     </>
   );
 }
+
+export default memo(BookmarkSidebar);

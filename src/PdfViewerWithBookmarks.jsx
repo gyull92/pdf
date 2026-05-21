@@ -1,15 +1,17 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import styled from "styled-components";
 import * as pdfjsLib from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.js?url";
 import "pdfjs-dist/web/pdf_viewer.css";
 import PageSidebar from "./components/SidePage";
 import BookmarkSidebar from "./components/BookMarkPage";
 import PdfToolbar from "./components/ToolBar";
+import { pdfCache, makeDocKey, makeRenderKey } from "./utils/pdfCache";
 import colorPenCursor from "./png/colorPen.png"; // 글자 형광펜
 import freeAreaCursor from "./png/freeArea.png"; // 자유영역 형광펜
 import eraserCursor from "./png/eraser.png"; // 지우개
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 let ipcRenderer = null;
 
@@ -21,6 +23,34 @@ if (typeof window !== "undefined" && window.require) {
     console.warn("ipcRenderer 로드 실패:", e);
   }
 }
+
+// 저장 디바운스 (localStorage·IPC 호출 빈도 완화)
+const safeSetLocalStorage = (key, value) => {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    console.warn(`localStorage 저장 실패(${key}):`, e);
+  }
+};
+
+const safeGetLocalStorage = (key) => {
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {
+    console.warn(`localStorage 읽기 실패(${key}):`, e);
+    return null;
+  }
+};
+
+const safeParseJSON = (raw, fallback = null) => {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("JSON 파싱 실패:", e);
+    return fallback;
+  }
+};
 
 // 🔹 파일 드래그인지 판별하는 헬퍼 (북마크 드래그와 구분용)
 const isFileDragEvent = (e) => {
@@ -128,11 +158,19 @@ const PagesWrapper = styled.div`
   padding-bottom: 40px;
 `;
 
-// ✅ 각 페이지 컨테이너: min-height로 페이지 높이를 미리 확보
+// ✅ 각 페이지 컨테이너: min-height/min-width로 페이지 높이를 미리 확보
+//    (윈도잉으로 캔버스가 해제되어도 스크롤 위치가 안정적)
 const PageContainer = styled.div`
   position: relative;
   margin-bottom: 20px;
   min-height: ${(props) => (props.$minHeight ? `${props.$minHeight}px` : "0")};
+  min-width: ${(props) => (props.$minWidth ? `${props.$minWidth}px` : "0")};
+  /* 🔹 스크롤 성능 최적화: 페이지 내부 변경이 외부 레이아웃에 영향 주지 않음을 명시
+     - layout: 자식의 레이아웃이 외부에 영향 주지 않음
+     - style: 자식의 카운터/quotes가 외부에 영향 주지 않음
+     - paint: 컨테이너 영역 밖으로 페인트가 나가지 않음
+     수천 페이지에 GPU 레이어를 생성하지 않으면서 스크롤 페인트 비용을 줄여줌 */
+  contain: layout style paint;
 `;
 
 // PDF 캔버스
@@ -172,54 +210,113 @@ const ACTUAL_SIZE_SCALE = 1.0;
 // 형광펜 색상
 const DEFAULT_HIGHLIGHT_COLOR = "rgba(0, 255, 0, 0.6)";
 
-// 텍스트 레이어 직접 렌더
-const renderTextLayerOnPage = async (page, viewport, container) => {
+// 🔹 성능 튜닝 상수
+//   - WINDOW_SIZE: 화면에 보이는 페이지 위·아래로 미리 렌더링할 페이지 수
+//   - KEEP_RENDERED_RANGE: 이 범위를 벗어난 페이지는 캔버스 픽셀을 해제
+//   - MAX_DPR: 고해상도 모니터에서 캔버스가 폭증하는 것을 방지
+//   - BODY_RENDER_CONCURRENCY / THUMB_RENDER_CONCURRENCY:
+//       CPU 코어 수에 맞춰 동시 렌더 수를 자동 조정 (코어가 많을수록 더 공격적으로)
+const WINDOW_SIZE = 3;
+const KEEP_RENDERED_RANGE = 6;
+const MAX_DPR = 1.5;
+
+const HARDWARE_CONCURRENCY =
+  typeof navigator !== "undefined" && navigator.hardwareConcurrency
+    ? navigator.hardwareConcurrency
+    : 4;
+
+// PDF.js의 메인 워커가 1개이므로 너무 크게 늘려도 효과가 줄어듦.
+// 하지만 메인 스레드 캔버스 그리기와 워커 작업이 겹쳐서 어느 정도 이득.
+const BODY_RENDER_CONCURRENCY = Math.max(
+  2,
+  Math.min(6, Math.floor(HARDWARE_CONCURRENCY / 2)),
+);
+const THUMB_RENDER_CONCURRENCY = Math.max(
+  1,
+  Math.min(3, Math.floor(HARDWARE_CONCURRENCY / 4)),
+);
+
+const getOutputScale = () =>
+  Math.min(
+    typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1,
+    MAX_DPR,
+  );
+
+// 텍스트 레이어 데이터(span 좌표 등)를 미리 계산
+//   - 캐시에 저장 가능한 평탄한 객체 배열로 반환
+//   - PDF.js의 viewport.transform * item.transform 결과를 미리 적용
+const computeTextLayerData = (textContent, viewport) => {
+  const items = textContent.items || [];
+  const styles = textContent.styles || {};
+  const data = new Array(items.length);
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const text = item.str || "";
+    if (!text) {
+      data[i] = null;
+      continue;
+    }
+    const mm = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const fontHeight = Math.hypot(mm[2], mm[3]);
+    const font = styles[item.fontName];
+    data[i] = {
+      text,
+      x: mm[4],
+      y: mm[5] - fontHeight,
+      fontHeight,
+      fontFamily: font?.fontFamily || null,
+    };
+  }
+  return data;
+};
+
+// 미리 계산된 textLayerData로 DOM 렌더
+const paintTextLayerFromData = (
+  container,
+  textLayerData,
+  cssWidth,
+  cssHeight,
+) => {
   if (!container) return;
-
-  const textContent = await page.getTextContent();
-
   container.innerHTML = "";
-  container.style.width = `${viewport.width}px`;
-  container.style.height = `${viewport.height}px`;
+  container.style.width = `${cssWidth}px`;
+  container.style.height = `${cssHeight}px`;
   container.style.position = "absolute";
   container.style.left = "0";
   container.style.top = "0";
 
-  const textItems = textContent.items || [];
-  const styles = textContent.styles || {};
-
   const frag = document.createDocumentFragment();
 
-  textItems.forEach((item, index) => {
-    const text = item.str || "";
-    if (!text) return;
-
-    const mm = pdfjsLib.Util.transform(viewport.transform, item.transform);
-    const fontHeight = Math.hypot(mm[2], mm[3]);
-    const x = mm[4];
-    const y = mm[5];
+  for (let i = 0; i < textLayerData.length; i++) {
+    const d = textLayerData[i];
+    if (!d) continue;
 
     const span = document.createElement("span");
-    span.textContent = text;
-    span.dataset.spanIndex = String(index);
-    span.dataset.rawText = text;
+    span.textContent = d.text;
+    span.dataset.spanIndex = String(i);
+    span.dataset.rawText = d.text;
     span.style.position = "absolute";
     span.style.whiteSpace = "pre";
-    span.style.fontSize = `${fontHeight}px`;
+    span.style.fontSize = `${d.fontHeight}px`;
     span.style.cursor = "inherit";
-
-    const font = styles[item.fontName];
-    if (font && font.fontFamily) {
-      span.style.fontFamily = font.fontFamily;
-    }
-
-    span.style.left = `${x}px`;
-    span.style.top = `${y - fontHeight}px`;
+    if (d.fontFamily) span.style.fontFamily = d.fontFamily;
+    span.style.left = `${d.x}px`;
+    span.style.top = `${d.y}px`;
 
     frag.appendChild(span);
-  });
+  }
 
   container.appendChild(frag);
+};
+
+// 텍스트 레이어 직접 렌더 (PDF.js 페이지에서 가져옴)
+const renderTextLayerOnPage = async (page, viewport, container) => {
+  if (!container) return null;
+  const textContent = await page.getTextContent();
+  const data = computeTextLayerData(textContent, viewport);
+  paintTextLayerFromData(container, data, viewport.width, viewport.height);
+  return data;
 };
 
 export default function PdfViewerWithBookmarks() {
@@ -232,6 +329,11 @@ export default function PdfViewerWithBookmarks() {
   const [fileName, setFileName] = useState("");
   const [filePath, setFilePath] = useState("");
   const [thumbnails, setThumbnails] = useState([]);
+  // 점프 시 즉시 미리보기로 쓸 수 있게 ref로도 미러링
+  const thumbnailsRef = useRef([]);
+  useEffect(() => {
+    thumbnailsRef.current = thumbnails;
+  }, [thumbnails]);
 
   const [tabs, setTabs] = useState([]);
   const [activeTabId, setActiveTabId] = useState(null);
@@ -261,6 +363,16 @@ export default function PdfViewerWithBookmarks() {
 
   // ✅ 이미 렌더 완료된 페이지 기록
   const renderedPagesRef = useRef(new Set());
+  // pdf/scale 변경 시 이전 렌더 결과 무시 (뒤집힘·깨짐 방지)
+  const renderGenerationRef = useRef(0);
+  const pageRenderTasksRef = useRef(new Map());
+  // 화면에 보이는 페이지 (형광펜 등 무거운 작업 범위 제한)
+  const visiblePagesRef = useRef(new Set());
+  const [visiblePagesVersion, setVisiblePagesVersion] = useState(0);
+
+  // 🔹 스크롤 중인지 추적 (스크롤 중에는 무거운 PDF.js 렌더링을 보류해 jank 방지)
+  const isScrollingRef = useRef(false);
+  const scrollSettleTimerRef = useRef(null);
 
   // 모드 상태
   const [isHighlightMode, setIsHighlightMode] = useState(false); // 자유영역 형광펜
@@ -273,76 +385,126 @@ export default function PdfViewerWithBookmarks() {
 
   const pdfCacheRef = useRef({});
 
-  // ✅ 페이지 기본 높이 저장 (1페이지 기준)
+  // ✅ 페이지 기본 높이/너비 저장 (1페이지 기준)
   const basePageHeightRef = useRef(null);
+  const basePageWidthRef = useRef(null);
   const baseScaleRef = useRef(INITIAL_SCALE);
+
+  // ✅ 캐시용 문서 키 (현재 활성 PDF)
+  const docKeyRef = useRef(null);
+  // ✅ 페이지별 메타(예: rotation, viewport size) 캐시 - 캐시 hit 시 PDF.js getPage를 건너뛰는 데 사용
+  const docMetaRef = useRef(null);
+
+  // 🔹 썸네일 렌더 상태
+  //   - 큐: 우선 처리할 페이지 번호 (사이드바의 보이는 페이지 기준)
+  //   - inProgress: 현재 렌더링 중인 페이지 (중복 방지)
+  //   - done: 이미 완료된 페이지
+  const thumbRequestQueueRef = useRef([]);
+  const thumbInProgressRef = useRef(new Set());
+  const thumbDoneRef = useRef(new Set());
+  const thumbWorkerActiveRef = useRef(false);
+
+  // 🔹 본문 우선: 본문에서 최소 1페이지가 렌더링되기 전엔 새 썸네일 렌더링을 보류
+  //    (IndexedDB에 이미 있는 캐시 썸네일은 그대로 즉시 표시됨)
+  const bodyFirstReadyRef = useRef(false);
 
   useEffect(() => {
     currentPageRef.current = currentPage;
   }, [currentPage]);
 
-  // 🔹 북마크/형광펜 로드
+  // 컴포넌트 언마운트 시: 모든 PDF 문서와 렌더 작업 정리
   useEffect(() => {
-    let hasLocalBookmarks = false;
-
-    try {
-      const savedLocalBookmarks = localStorage.getItem("gyul-pdf-bookmarks");
-      if (savedLocalBookmarks) {
-        const parsed = JSON.parse(savedLocalBookmarks);
-        if (Array.isArray(parsed)) {
-          setBookmarks(parsed);
-          hasLocalBookmarks = parsed.length > 0;
+    return () => {
+      pageRenderTasksRef.current.forEach((task) => {
+        try {
+          task.cancel();
+        } catch (_) {
+          /* ignore */
         }
-      }
-    } catch (e) {
-      console.warn("localStorage 북마크 파싱 실패:", e);
+      });
+      pageRenderTasksRef.current.clear();
+      Object.values(pdfCacheRef.current).forEach((doc) => {
+        try {
+          doc?.destroy?.();
+        } catch (_) {
+          /* ignore */
+        }
+      });
+      pdfCacheRef.current = {};
+    };
+  }, []);
+
+  // 🔹 북마크/형광펜 로드 (한 번만)
+  useEffect(() => {
+    const localBookmarks = safeParseJSON(
+      safeGetLocalStorage("gyul-pdf-bookmarks"),
+      [],
+    );
+    if (Array.isArray(localBookmarks) && localBookmarks.length > 0) {
+      setBookmarks(localBookmarks);
     }
 
-    try {
-      const savedHighlights = localStorage.getItem("gyul-pdf-highlights");
-      if (savedHighlights) {
-        const parsed = JSON.parse(savedHighlights);
-        if (Array.isArray(parsed)) {
-          setHighlights(parsed);
-        }
-      }
-    } catch (e) {
-      console.warn("localStorage 하이라이트 파싱 실패:", e);
+    const localHighlights = safeParseJSON(
+      safeGetLocalStorage("gyul-pdf-highlights"),
+      [],
+    );
+    if (Array.isArray(localHighlights)) {
+      setHighlights(localHighlights);
     }
 
+    let cancelled = false;
     (async () => {
       if (!ipcRenderer) return;
       try {
         const fileBookmarks = await ipcRenderer.invoke("load-bookmarks");
-        if (Array.isArray(fileBookmarks) && fileBookmarks.length > 0) {
+        if (
+          !cancelled &&
+          Array.isArray(fileBookmarks) &&
+          fileBookmarks.length > 0
+        ) {
           setBookmarks(fileBookmarks);
-        } else {
-          if (!hasLocalBookmarks) {
-            // 첫 실행 시 별도 처리 없음
-          }
         }
       } catch (e) {
         console.warn("파일에서 북마크 로드 실패:", e);
       }
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // 북마크 저장
+  // 북마크 저장 (디바운스 + 첫 마운트 스킵)
+  const bookmarksMountedRef = useRef(false);
   useEffect(() => {
-    try {
-      localStorage.setItem("gyul-pdf-bookmarks", JSON.stringify(bookmarks));
-    } catch (e) {}
-
-    if (ipcRenderer) {
-      ipcRenderer.send("save-bookmarks", bookmarks);
+    if (!bookmarksMountedRef.current) {
+      bookmarksMountedRef.current = true;
+      return;
     }
+    const timer = setTimeout(() => {
+      safeSetLocalStorage("gyul-pdf-bookmarks", JSON.stringify(bookmarks));
+      if (ipcRenderer) {
+        try {
+          ipcRenderer.send("save-bookmarks", bookmarks);
+        } catch (e) {
+          console.warn("save-bookmarks IPC 실패:", e);
+        }
+      }
+    }, 300);
+    return () => clearTimeout(timer);
   }, [bookmarks]);
 
-  // 형광펜 저장
+  // 형광펜 저장 (디바운스 + 첫 마운트 스킵)
+  const highlightsMountedRef = useRef(false);
   useEffect(() => {
-    try {
-      localStorage.setItem("gyul-pdf-highlights", JSON.stringify(highlights));
-    } catch (e) {}
+    if (!highlightsMountedRef.current) {
+      highlightsMountedRef.current = true;
+      return;
+    }
+    const timer = setTimeout(() => {
+      safeSetLocalStorage("gyul-pdf-highlights", JSON.stringify(highlights));
+    }, 300);
+    return () => clearTimeout(timer);
   }, [highlights]);
 
   // 페이지 입력 동기화
@@ -350,31 +512,49 @@ export default function PdfViewerWithBookmarks() {
     setPageInput(String(currentPage));
   }, [currentPage]);
 
-  // 활성 탭 상태 동기화
+  // 활성 탭 상태 동기화 (변경된 필드가 있을 때만 setTabs 호출)
   useEffect(() => {
     if (!activeTabId) return;
 
-    setTabs((prev) =>
-      prev.map((tab) =>
-        tab.id === activeTabId
-          ? {
-              ...tab,
-              fileName,
-              filePath,
-              pdf,
-              totalPages,
-              currentPage,
-              pageInput,
-              scale,
-              thumbnails,
-              pageTexts,
-              searchQuery,
-              searchMatches,
-              searchIndex,
-            }
-          : tab
-      )
-    );
+    setTabs((prev) => {
+      const idx = prev.findIndex((t) => t.id === activeTabId);
+      if (idx === -1) return prev;
+      const tab = prev[idx];
+      if (
+        tab.fileName === fileName &&
+        tab.filePath === filePath &&
+        tab.pdf === pdf &&
+        tab.totalPages === totalPages &&
+        tab.currentPage === currentPage &&
+        tab.pageInput === pageInput &&
+        tab.scale === scale &&
+        tab.thumbnails === thumbnails &&
+        tab.pageTexts === pageTexts &&
+        tab.searchQuery === searchQuery &&
+        tab.searchMatches === searchMatches &&
+        tab.searchIndex === searchIndex
+      ) {
+        return prev;
+      }
+      const next = prev.slice();
+      next[idx] = {
+        ...tab,
+        fileName,
+        filePath,
+        pdf,
+        totalPages,
+        currentPage,
+        pageInput,
+        scale,
+        thumbnails,
+        pageTexts,
+        searchQuery,
+        searchMatches,
+        searchIndex,
+        docKey: tab.docKey || docKeyRef.current,
+      };
+      return next;
+    });
   }, [
     activeTabId,
     fileName,
@@ -392,8 +572,8 @@ export default function PdfViewerWithBookmarks() {
   ]);
 
   // 검색 하이라이트(파란색)
-  const applySearchHighlightForPage = (pageNum) => {
-    const q = searchQuery.trim();
+  const applySearchHighlightForPage = useCallback((pageNum, query) => {
+    const q = (query ?? "").trim();
     const textLayerDiv = textLayerRefs.current[pageNum - 1];
     if (!textLayerDiv) return;
 
@@ -430,7 +610,7 @@ export default function PdfViewerWithBookmarks() {
       while (index !== -1) {
         if (index > lastIndex) {
           frag.appendChild(
-            document.createTextNode(fullText.slice(lastIndex, index))
+            document.createTextNode(fullText.slice(lastIndex, index)),
           );
         }
         const mark = document.createElement("span");
@@ -448,7 +628,7 @@ export default function PdfViewerWithBookmarks() {
       el.innerHTML = "";
       el.appendChild(frag);
     });
-  };
+  }, []);
 
   // Ctrl+Z: 마지막 형광펜 삭제
   useEffect(() => {
@@ -483,126 +663,803 @@ export default function PdfViewerWithBookmarks() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [fileName]);
 
-  // 🔹 렌더 큐 생성: currentPage 기준 (아래→위, 그 다음 위쪽)
-  const buildRenderQueue = (total, current) => {
-    const rendered = renderedPagesRef.current;
-    const queue = [];
+  // 🔹 윈도잉: 보이는 페이지 ± WINDOW_SIZE만 그리고, KEEP_RENDERED_RANGE를 벗어난 페이지는 해제
+  const computeRenderTargets = (total) => {
+    const visible = visiblePagesRef.current;
+    const cp = currentPageRef.current || 1;
 
-    let maxRenderedBelow = 0;
-    rendered.forEach((p) => {
-      if (p < current && p > maxRenderedBelow) {
-        maxRenderedBelow = p;
+    const centers = new Set();
+    if (visible.size > 0) {
+      visible.forEach((p) => centers.add(p));
+    } else {
+      centers.add(cp);
+    }
+
+    const renderTargets = new Set();
+    const keepTargets = new Set();
+
+    centers.forEach((c) => {
+      for (let k = -WINDOW_SIZE; k <= WINDOW_SIZE; k++) {
+        const p = c + k;
+        if (p >= 1 && p <= total) renderTargets.add(p);
+      }
+      for (let k = -KEEP_RENDERED_RANGE; k <= KEEP_RENDERED_RANGE; k++) {
+        const p = c + k;
+        if (p >= 1 && p <= total) keepTargets.add(p);
       }
     });
 
-    // 1) current → maxRenderedBelow+1 까지 내려가기
-    for (let p = current; p > maxRenderedBelow; p--) {
-      if (!rendered.has(p)) {
-        queue.push(p);
-      }
-    }
-
-    // 2) current+1 → total 까지 올라가기
-    for (let p = current + 1; p <= total; p++) {
-      if (!rendered.has(p)) {
-        queue.push(p);
-      }
-    }
-
-    return queue;
+    return { renderTargets, keepTargets };
   };
 
-  // 한 페이지 렌더 (본문 + 썸네일 동시 생성)
-  const renderPage = async (num, scaleValue = scale) => {
-    if (!pdf) return;
-    const canvas = canvasRefs.current[num - 1];
-    const textLayerDiv = textLayerRefs.current[num - 1];
-    const highlightCanvas = highlightCanvasRefs.current[num - 1];
+  const cancelAllPageRenderTasks = () => {
+    pageRenderTasksRef.current.forEach((task) => {
+      try {
+        task.cancel();
+      } catch (_) {
+        /* ignore */
+      }
+    });
+    pageRenderTasksRef.current.clear();
+  };
 
-    if (!canvas || !textLayerDiv) return;
+  // keepSet에 포함되지 않은 페이지의 렌더 작업만 취소
+  // (멀리 점프할 때 워커를 즉시 해제하여 target 페이지를 우선 처리)
+  const cancelRenderTasksExcept = (keepSet) => {
+    const tasks = pageRenderTasksRef.current;
+    Array.from(tasks.entries()).forEach(([pageNum, task]) => {
+      if (keepSet && keepSet.has(pageNum)) return;
+      try {
+        task.cancel();
+      } catch (_) {
+        /* ignore */
+      }
+      tasks.delete(pageNum);
+    });
+  };
 
-    const page = await pdf.getPage(num);
-    const viewport = page.getViewport({ scale: scaleValue });
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+  // 특정 페이지의 캔버스/텍스트 레이어 픽셀 메모리를 해제
+  // (페이지 컨테이너의 CSS 크기는 estimatedPageHeight로 유지되어 스크롤 위치 보존)
+  const releasePageMemory = (pageNum) => {
+    const canvas = canvasRefs.current[pageNum - 1];
+    const highlightCanvas = highlightCanvasRefs.current[pageNum - 1];
+    const textLayerDiv = textLayerRefs.current[pageNum - 1];
 
-    // --- 본문 렌더 ---
-    canvas.height = viewport.height;
-    canvas.width = viewport.width;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    await renderTextLayerOnPage(page, viewport, textLayerDiv);
-
-    // --- 형광펜 캔버스 사이즈 동기화 ---
-    if (highlightCanvas) {
-      highlightCanvas.width = canvas.width;
-      highlightCanvas.height = canvas.height;
+    const task = pageRenderTasksRef.current.get(pageNum);
+    if (task) {
+      try {
+        task.cancel();
+      } catch (_) {
+        /* ignore */
+      }
+      pageRenderTasksRef.current.delete(pageNum);
     }
 
-    // --- 검색 하이라이트 적용 ---
-    applySearchHighlightForPage(num);
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+      canvas.style.width = "";
+      canvas.style.height = "";
+    }
+    if (highlightCanvas) {
+      highlightCanvas.width = 0;
+      highlightCanvas.height = 0;
+      highlightCanvas.style.width = "";
+      highlightCanvas.style.height = "";
+    }
+    if (textLayerDiv) {
+      textLayerDiv.innerHTML = "";
+      textLayerDiv.style.width = "";
+      textLayerDiv.style.height = "";
+    }
+    renderedPagesRef.current.delete(pageNum);
+  };
 
-    // --- 썸네일 생성: 본문 캔버스를 축소해서 thumbnails[num-1] 채우기 ---
+  const releaseAllPagesMemory = () => {
+    for (let p = 1; p <= totalPages; p++) {
+      releasePageMemory(p);
+    }
+  };
+
+  // 🔹 점프 시 즉시 시각 피드백을 주기 위해 썸네일을 캔버스에 흐릿하게 깔아두기
+  //    (본문 renderPage가 완료되면 자연스럽게 덮어쓰임)
+  const drawPreviewFromThumb = (num) => {
+    if (!num) return false;
+    if (renderedPagesRef.current.has(num)) return false;
+    const thumb = thumbnailsRef.current?.[num - 1];
+    if (!thumb) return false;
+
+    const canvas = canvasRefs.current[num - 1];
+    if (!canvas) return false;
+
+    const baseW = basePageWidthRef.current;
+    const baseH = basePageHeightRef.current;
+    const baseS = baseScaleRef.current;
+    if (!baseW || !baseH || !baseS) return false;
+
+    const cssWidth = (baseW * scale) / baseS;
+    const cssHeight = (baseH * scale) / baseS;
+    const outputScale = getOutputScale();
+    const pxWidth = Math.floor(cssWidth * outputScale);
+    const pxHeight = Math.floor(cssHeight * outputScale);
+
+    const highlightCanvas = highlightCanvasRefs.current[num - 1];
+    const pageContainer = pageContainerRefs.current[num - 1];
+
     try {
-      setThumbnails((prev) => {
-        const length = (prev && prev.length) || totalPages || num;
-        const next =
-          prev && prev.length === length
-            ? [...prev]
-            : new Array(length).fill(null);
+      sizeUpCanvas(
+        canvas,
+        highlightCanvas,
+        pageContainer,
+        cssWidth,
+        cssHeight,
+        pxWidth,
+        pxHeight,
+      );
+    } catch (_) {
+      /* ignore */
+    }
 
-        if (next[num - 1]) return next;
+    const generation = renderGenerationRef.current;
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      // 그 사이에 실제 렌더가 완료되었거나 generation이 바뀌었으면 덮지 않음
+      if (generation !== renderGenerationRef.current) return;
+      if (renderedPagesRef.current.has(num)) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      try {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "medium";
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      } catch (_) {
+        /* ignore */
+      }
+    };
+    img.src = thumb;
+    return true;
+  };
 
-        const THUMB_WIDTH = 80;
-        const ratio = canvas.height / canvas.width || 1;
-        const thumbCanvas = document.createElement("canvas");
-        thumbCanvas.width = THUMB_WIDTH;
-        thumbCanvas.height = THUMB_WIDTH * ratio;
+  const resetRenderState = () => {
+    renderedPagesRef.current = new Set();
+    renderGenerationRef.current += 1;
+    cancelAllPageRenderTasks();
+  };
 
-        const tctx = thumbCanvas.getContext("2d");
-        if (tctx) {
-          tctx.drawImage(
-            canvas,
-            0,
-            0,
-            canvas.width,
-            canvas.height,
-            0,
-            0,
-            thumbCanvas.width,
-            thumbCanvas.height
-          );
-          next[num - 1] = thumbCanvas.toDataURL("image/png");
-        }
+  const isRenderCancelledError = (err) =>
+    err?.name === "RenderingCancelledException" ||
+    (typeof err?.message === "string" &&
+      err.message.includes("Rendering cancelled"));
 
-        return next;
-      });
+  // 캔버스를 특정 크기로 셋업
+  const sizeUpCanvas = (canvas, highlightCanvas, pageContainer, cssWidth, cssHeight, pxWidth, pxHeight) => {
+    canvas.width = pxWidth;
+    canvas.height = pxHeight;
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+    if (highlightCanvas) {
+      highlightCanvas.width = pxWidth;
+      highlightCanvas.height = pxHeight;
+      highlightCanvas.style.width = `${cssWidth}px`;
+      highlightCanvas.style.height = `${cssHeight}px`;
+    }
+    if (pageContainer) {
+      pageContainer.style.width = `${cssWidth}px`;
+      pageContainer.style.height = `${cssHeight}px`;
+    }
+  };
+
+  // 🔹 본문 캔버스에서 썸네일 추출(보너스 경로 - 본문이 그려진 김에 만들기)
+  const THUMB_WIDTH = 80;
+  const writeThumbnail = (num, dataUrl) => {
+    if (!dataUrl) return;
+    thumbDoneRef.current.add(num);
+    setThumbnails((prev) => {
+      const length = (prev && prev.length) || totalPages || num;
+      const next =
+        prev && prev.length === length
+          ? [...prev]
+          : new Array(length).fill(null);
+      if (next[num - 1]) return next;
+      next[num - 1] = dataUrl;
+      return next;
+    });
+    const docKey = docKeyRef.current;
+    if (docKey) {
+      pdfCache.setThumb(docKey, num, dataUrl).catch(() => {});
+    }
+  };
+
+  const updateThumbnailFromCanvas = (num, canvas) => {
+    if (thumbDoneRef.current.has(num)) return;
+    try {
+      if (!canvas.width || !canvas.height) return;
+      const ratio = canvas.height / canvas.width || 1;
+      const thumbCanvas = document.createElement("canvas");
+      thumbCanvas.width = THUMB_WIDTH;
+      thumbCanvas.height = THUMB_WIDTH * ratio;
+      const tctx = thumbCanvas.getContext("2d");
+      if (!tctx) return;
+      tctx.drawImage(
+        canvas,
+        0,
+        0,
+        canvas.width,
+        canvas.height,
+        0,
+        0,
+        thumbCanvas.width,
+        thumbCanvas.height,
+      );
+      const dataUrl = thumbCanvas.toDataURL("image/jpeg", 0.8);
+      writeThumbnail(num, dataUrl);
     } catch (e) {
       console.warn("썸네일 생성 실패:", e);
     }
   };
 
-  // pdf/scale/totalPages 바뀔 때 렌더 기록 초기화
+  // 🔹 저배율 전용 썸네일 렌더링 (본문과 독립적, 매우 빠름)
+  const renderThumbnailForPage = async (num) => {
+    if (!pdf) return null;
+    if (thumbDoneRef.current.has(num)) return null;
+    try {
+      const page = await pdf.getPage(num);
+      const baseViewport = page.getViewport({
+        scale: 1.0,
+        rotation: page.rotate,
+      });
+      const thumbScale = THUMB_WIDTH / baseViewport.width;
+      const viewport = page.getViewport({
+        scale: thumbScale,
+        rotation: page.rotate,
+      });
+
+      const thumbCanvas = document.createElement("canvas");
+      thumbCanvas.width = Math.max(1, Math.floor(viewport.width));
+      thumbCanvas.height = Math.max(1, Math.floor(viewport.height));
+      const ctx = thumbCanvas.getContext("2d");
+      if (!ctx) return null;
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      return thumbCanvas.toDataURL("image/jpeg", 0.8);
+    } catch (e) {
+      // 페이지 객체 무효 등은 무시
+      return null;
+    }
+  };
+
+  // 🔹 우선순위 큐 워커: N개 슬롯 병렬 처리 + requestIdleCallback로 양보
+  const startThumbWorker = () => {
+    if (thumbWorkerActiveRef.current) return;
+    if (!pdf) return;
+    // 본문 우선: 본문이 첫 페이지를 그리기 전엔 새 썸네일 렌더링을 시작하지 않음
+    // (요청은 큐에 쌓아두었다가 본문이 준비되면 즉시 처리)
+    if (!bodyFirstReadyRef.current) return;
+    thumbWorkerActiveRef.current = true;
+
+    // 포어그라운드에서는 UI에 양보 (requestIdleCallback),
+    // 백그라운드(hidden)에서는 throttle 회피를 위해 즉시 다음 단계 (setTimeout)
+    const yieldNext = (cb) => {
+      if (typeof document !== "undefined" && document.hidden) {
+        setTimeout(cb, 0);
+      } else if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(cb, { timeout: 200 });
+      } else {
+        setTimeout(cb, 0);
+      }
+    };
+
+    const generationAtStart = renderGenerationRef.current;
+    let activeSlots = 0;
+
+    const pickNext = () => {
+      const queue = thumbRequestQueueRef.current;
+      while (queue.length) {
+        const p = queue.shift();
+        if (
+          !p ||
+          thumbDoneRef.current.has(p) ||
+          thumbInProgressRef.current.has(p)
+        )
+          continue;
+        return p;
+      }
+      // 큐가 비어 있으면 1페이지부터 미완료 페이지 순차적으로
+      const total = totalPages || 0;
+      for (let p = 1; p <= total; p++) {
+        if (
+          !thumbDoneRef.current.has(p) &&
+          !thumbInProgressRef.current.has(p)
+        ) {
+          return p;
+        }
+      }
+      return null;
+    };
+
+    const slotStep = async () => {
+      if (
+        !thumbWorkerActiveRef.current ||
+        generationAtStart !== renderGenerationRef.current
+      ) {
+        activeSlots = Math.max(0, activeSlots - 1);
+        if (activeSlots === 0) thumbWorkerActiveRef.current = false;
+        return;
+      }
+      const next = pickNext();
+      if (next == null) {
+        activeSlots = Math.max(0, activeSlots - 1);
+        if (activeSlots === 0) thumbWorkerActiveRef.current = false;
+        return;
+      }
+
+      thumbInProgressRef.current.add(next);
+      try {
+        const dataUrl = await renderThumbnailForPage(next);
+        if (generationAtStart !== renderGenerationRef.current) {
+          activeSlots = Math.max(0, activeSlots - 1);
+          if (activeSlots === 0) thumbWorkerActiveRef.current = false;
+          return;
+        }
+        if (dataUrl) {
+          writeThumbnail(next, dataUrl);
+        } else {
+          thumbDoneRef.current.add(next);
+        }
+      } catch (_) {
+        thumbDoneRef.current.add(next);
+      } finally {
+        thumbInProgressRef.current.delete(next);
+      }
+      // 다음 페이지로 (idle 시간에 양보)
+      yieldNext(slotStep);
+    };
+
+    // N개 슬롯을 동시에 띄움 (각 슬롯이 한 페이지씩 처리)
+    const slots = Math.max(1, THUMB_RENDER_CONCURRENCY);
+    for (let i = 0; i < slots; i++) {
+      activeSlots += 1;
+      yieldNext(slotStep);
+    }
+  };
+
+  // 🔹 백그라운드 사전 렌더: DOM 캔버스 건드리지 않고 오프스크린 캔버스로 렌더해서 IndexedDB에만 저장
+  //    - 사용자가 다른 창으로 잠시 자리 비웠을 때 모든 페이지를 미리 캐싱
+  //    - 다시 돌아와 스크롤하면 캐시 hit으로 즉시 표시됨
+  const prerenderInFlightRef = useRef(new Set());
+  const prerenderDoneRef = useRef(new Set());
+
+  const renderPageToCache = async (num) => {
+    if (!pdf) return false;
+    const docKey = docKeyRef.current;
+    if (!docKey) return false;
+
+    const outputScale = getOutputScale();
+    const scaleValue = scale;
+    const renderKey = makeRenderKey(docKey, num, scaleValue, outputScale);
+
+    // 이미 캐시되어 있으면 즉시 종료
+    try {
+      const cached = await pdfCache.getRender(renderKey);
+      if (cached) return true;
+    } catch (_) {
+      /* ignore */
+    }
+
+    let page;
+    try {
+      page = await pdf.getPage(num);
+    } catch (_) {
+      return false;
+    }
+
+    const viewport = page.getViewport({
+      scale: scaleValue,
+      rotation: page.rotate,
+    });
+    const cssWidth = viewport.width;
+    const cssHeight = viewport.height;
+    const pxWidth = Math.floor(cssWidth * outputScale);
+    const pxHeight = Math.floor(cssHeight * outputScale);
+
+    const off = document.createElement("canvas");
+    off.width = Math.max(1, pxWidth);
+    off.height = Math.max(1, pxHeight);
+    const ctx = off.getContext("2d");
+    if (!ctx) return false;
+
+    const transform =
+      outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
+    const renderTask = page.render({
+      canvasContext: ctx,
+      viewport,
+      transform,
+    });
+
+    try {
+      await renderTask.promise;
+    } catch (err) {
+      if (isRenderCancelledError(err)) return false;
+      return false;
+    }
+
+    // 텍스트 레이어 데이터도 함께 캐싱 (다음 표시에서 PDF.js 호출 회피)
+    let textLayerData = null;
+    try {
+      const textContent = await page.getTextContent();
+      textLayerData = computeTextLayerData(textContent, viewport);
+    } catch (_) {
+      textLayerData = null;
+    }
+
+    await new Promise((resolve) => {
+      try {
+        off.toBlob(
+          (blob) => {
+            if (!blob) {
+              resolve();
+              return;
+            }
+            pdfCache
+              .setRender(renderKey, {
+                docKey,
+                imageBlob: blob,
+                cssWidth,
+                cssHeight,
+                outputScale,
+                textLayer: textLayerData,
+              })
+              .then(() => resolve())
+              .catch(() => resolve());
+          },
+          "image/jpeg",
+          0.85,
+        );
+      } catch (_) {
+        resolve();
+      }
+    });
+
+    return true;
+  };
+
+  // SidePage에서 호출하는 우선 요청 핸들러
+  const requestThumbnail = useCallback(
+    (pageNum) => {
+      if (!pdf || !pageNum) return;
+      if (pageNum < 1 || pageNum > totalPages) return;
+      if (thumbDoneRef.current.has(pageNum)) return;
+      // 큐 맨 앞에 추가 (최근 보인 페이지가 우선)
+      const queue = thumbRequestQueueRef.current;
+      const idx = queue.indexOf(pageNum);
+      if (idx !== -1) queue.splice(idx, 1);
+      queue.unshift(pageNum);
+      startThumbWorker();
+    },
+    [pdf, totalPages],
+  );
+
+  // 한 페이지 렌더 (캐시 hit이면 PDF.js 호출 우회)
+  const renderPage = async (num, scaleValue = scale) => {
+    const canvas = canvasRefs.current[num - 1];
+    const textLayerDiv = textLayerRefs.current[num - 1];
+    const highlightCanvas = highlightCanvasRefs.current[num - 1];
+    const pageContainer = pageContainerRefs.current[num - 1];
+
+    if (!canvas || !textLayerDiv) return false;
+
+    const generation = renderGenerationRef.current;
+    const outputScale = getOutputScale();
+    const docKey = docKeyRef.current;
+
+    // 1) 캐시 hit 시도 - PDF.js 없이 즉시 표시
+    if (docKey) {
+      const renderKey = makeRenderKey(docKey, num, scaleValue, outputScale);
+      try {
+        const cached = await pdfCache.getRender(renderKey);
+        if (
+          cached &&
+          cached.imageBlob &&
+          generation === renderGenerationRef.current
+        ) {
+          const cssWidth = cached.cssWidth;
+          const cssHeight = cached.cssHeight;
+          const pxWidth = Math.floor(cssWidth * outputScale);
+          const pxHeight = Math.floor(cssHeight * outputScale);
+
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return false;
+
+          sizeUpCanvas(
+            canvas,
+            highlightCanvas,
+            pageContainer,
+            cssWidth,
+            cssHeight,
+            pxWidth,
+            pxHeight,
+          );
+
+          // Blob → ImageBitmap → 캔버스 (디코딩이 워커에서 일어나 매우 빠름)
+          let bitmap = null;
+          try {
+            bitmap = await createImageBitmap(cached.imageBlob);
+          } catch (_) {
+            bitmap = null;
+          }
+          if (generation !== renderGenerationRef.current) {
+            try {
+              bitmap?.close?.();
+            } catch (_) {
+              /* ignore */
+            }
+            return false;
+          }
+
+          if (bitmap) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            try {
+              bitmap.close?.();
+            } catch (_) {
+              /* ignore */
+            }
+
+            // 텍스트 레이어 즉시 복원
+            if (Array.isArray(cached.textLayer)) {
+              paintTextLayerFromData(
+                textLayerDiv,
+                cached.textLayer,
+                cssWidth,
+                cssHeight,
+              );
+            } else if (pdf) {
+              // textLayer가 캐시에 없으면 PDF.js로 빠르게 보충
+              try {
+                const page = await pdf.getPage(num);
+                if (generation === renderGenerationRef.current) {
+                  const viewport = page.getViewport({
+                    scale: scaleValue,
+                    rotation: page.rotate,
+                  });
+                  await renderTextLayerOnPage(page, viewport, textLayerDiv);
+                }
+              } catch (_) {
+                /* ignore */
+              }
+            }
+
+            applySearchHighlightForPage(num, searchQuery);
+
+            // 썸네일이 없으면 즉시 캐시 hit 캔버스에서 생성
+            updateThumbnailFromCanvas(num, canvas);
+            return true;
+          }
+        }
+      } catch (e) {
+        // 캐시 실패는 무시하고 일반 렌더로
+        console.warn("렌더 캐시 조회 실패:", e);
+      }
+    }
+
+    // 2) 일반 렌더 - PDF.js로 그리기
+    if (!pdf) return false;
+
+    const page = await pdf.getPage(num);
+    if (generation !== renderGenerationRef.current) return false;
+
+    const viewport = page.getViewport({
+      scale: scaleValue,
+      rotation: page.rotate,
+    });
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return false;
+
+    const prevTask = pageRenderTasksRef.current.get(num);
+    if (prevTask) {
+      try {
+        prevTask.cancel();
+      } catch (_) {
+        /* ignore */
+      }
+      pageRenderTasksRef.current.delete(num);
+    }
+
+    const cssWidth = viewport.width;
+    const cssHeight = viewport.height;
+    const pxWidth = Math.floor(cssWidth * outputScale);
+    const pxHeight = Math.floor(cssHeight * outputScale);
+
+    sizeUpCanvas(
+      canvas,
+      highlightCanvas,
+      pageContainer,
+      cssWidth,
+      cssHeight,
+      pxWidth,
+      pxHeight,
+    );
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const transform =
+      outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
+    const renderTask = page.render({
+      canvasContext: ctx,
+      viewport,
+      transform,
+    });
+    pageRenderTasksRef.current.set(num, renderTask);
+
+    try {
+      await renderTask.promise;
+    } catch (err) {
+      if (pageRenderTasksRef.current.get(num) === renderTask) {
+        pageRenderTasksRef.current.delete(num);
+      }
+      if (isRenderCancelledError(err)) return false;
+      throw err;
+    }
+
+    if (pageRenderTasksRef.current.get(num) === renderTask) {
+      pageRenderTasksRef.current.delete(num);
+    }
+
+    if (generation !== renderGenerationRef.current) return false;
+
+    const textLayerData = await renderTextLayerOnPage(
+      page,
+      viewport,
+      textLayerDiv,
+    );
+
+    applySearchHighlightForPage(num, searchQuery);
+    updateThumbnailFromCanvas(num, canvas);
+
+    // 3) 결과를 영구 캐시에 저장 (비동기, 메인 스레드 영향 최소)
+    if (docKey) {
+      const renderKey = makeRenderKey(docKey, num, scaleValue, outputScale);
+      try {
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) return;
+            pdfCache
+              .setRender(renderKey, {
+                docKey,
+                imageBlob: blob,
+                cssWidth,
+                cssHeight,
+                outputScale,
+                textLayer: textLayerData,
+              })
+              .catch(() => {});
+          },
+          "image/jpeg",
+          0.85,
+        );
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    return true;
+  };
+
+  // pdf/scale/totalPages 바뀔 때 렌더 기록 초기화 + 캔버스 픽셀 해제
   useEffect(() => {
-    renderedPagesRef.current = new Set();
+    resetRenderState();
+    releaseAllPagesMemory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdf, totalPages, scale]);
 
-  // 🔹 백그라운드 렌더: currentPage 기준 우선순위
+  // PDF 변경 시 썸네일 큐/상태 초기화 + 영구 캐시 일괄 로드
   useEffect(() => {
+    thumbRequestQueueRef.current = [];
+    thumbInProgressRef.current = new Set();
+    thumbDoneRef.current = new Set();
+    thumbWorkerActiveRef.current = false;
+    // 본문이 다시 첫 페이지를 그릴 때까지 새 썸네일 렌더링은 보류
+    bodyFirstReadyRef.current = false;
+
     if (!pdf || totalPages === 0) return;
+    const docKey = docKeyRef.current;
+    if (!docKey) return;
 
     let cancelled = false;
-    const queue = buildRenderQueue(totalPages, currentPage);
-    const MAX_CONCURRENT = 4;
+    (async () => {
+      try {
+        const cached = await pdfCache.getThumbsForDoc(docKey, totalPages);
+        if (cancelled) return;
+        setThumbnails((prev) => {
+          const length = prev?.length || totalPages;
+          const next =
+            prev && prev.length === length
+              ? [...prev]
+              : new Array(length).fill(null);
+          cached.forEach((t, i) => {
+            if (t && !next[i]) {
+              next[i] = t;
+              thumbDoneRef.current.add(i + 1);
+            }
+          });
+          return next;
+        });
+        // 본문이 준비되었으면 즉시 시작, 아니면 본문 렌더 후 자동 시작
+        if (bodyFirstReadyRef.current) startThumbWorker();
+      } catch (_) {
+        if (bodyFirstReadyRef.current) startThumbWorker();
+      }
+    })();
+
+    // 안전 타임아웃: 본문 렌더가 늦어져도 1.5초 후엔 썸네일 워커 가동 (잠금 방지)
+    const fallbackTimer = setTimeout(() => {
+      if (cancelled) return;
+      if (!bodyFirstReadyRef.current) {
+        bodyFirstReadyRef.current = true;
+        startThumbWorker();
+      }
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(fallbackTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdf, totalPages]);
+
+  // 🔹 백그라운드 렌더 + 윈도우 밖 메모리 해제
+  useEffect(() => {
+    if (!pdf || totalPages === 0) return;
+    // 스크롤 중에는 무거운 PDF.js 렌더링을 보류하여 jank 방지
+    // (스크롤이 settle되면 visiblePagesVersion이 증가하여 이 effect가 다시 실행됨)
+    if (isScrollingRef.current) return;
+
+    const { renderTargets, keepTargets } = computeRenderTargets(totalPages);
+
+    // 1) 캐싱 범위(KEEP_RENDERED_RANGE)를 벗어난 페이지는 해제
+    const toRelease = [];
+    renderedPagesRef.current.forEach((p) => {
+      if (!keepTargets.has(p)) toRelease.push(p);
+    });
+    toRelease.forEach((p) => releasePageMemory(p));
+
+    // 2) 렌더해야 하는 페이지를 currentPage에 가까운 순으로 정렬
+    //    이미 렌더 진행 중인 페이지(jumpToPage 우선 블록 등)는 중복 큐잉하지 않음
+    const cp = currentPageRef.current || 1;
+    const queue = [];
+    renderTargets.forEach((p) => {
+      if (renderedPagesRef.current.has(p)) return;
+      if (pageRenderTasksRef.current.has(p)) return;
+      queue.push(p);
+    });
+    queue.sort((a, b) => Math.abs(a - cp) - Math.abs(b - cp));
+
+    let cancelled = false;
+    const generationAtStart = renderGenerationRef.current;
+    const MAX_CONCURRENT = BODY_RENDER_CONCURRENCY;
 
     const worker = async () => {
       while (!cancelled && queue.length) {
+        // 도중에 스크롤이 시작되면 즉시 양보. settle 시 effect가 재실행됨.
+        if (isScrollingRef.current) return;
         const pageNum = queue.shift();
         if (!pageNum) break;
         try {
-          await renderPage(pageNum, scale);
-          renderedPagesRef.current.add(pageNum);
+          const ok = await renderPage(pageNum, scale);
+          if (
+            ok &&
+            !cancelled &&
+            generationAtStart === renderGenerationRef.current
+          ) {
+            renderedPagesRef.current.add(pageNum);
+            // 본문이 1페이지라도 그려지면 썸네일 워커 가동 허용 (1회성)
+            if (!bodyFirstReadyRef.current) {
+              bodyFirstReadyRef.current = true;
+              startThumbWorker();
+            }
+          }
         } catch (e) {
           console.error(e);
         }
@@ -617,20 +1474,125 @@ export default function PdfViewerWithBookmarks() {
     return () => {
       cancelled = true;
     };
-  }, [pdf, totalPages, scale, currentPage]);
+  }, [pdf, totalPages, scale, currentPage, visiblePagesVersion]);
+
+  // 🔹 백그라운드 사전 렌더 워커
+  //    - 창이 가려져 있을 때(document.hidden) 모든 페이지를 IndexedDB에 미리 캐싱
+  //    - 사용자가 다시 돌아왔을 때 어디로 스크롤/점프해도 즉시 표시됨
+  //    - Electron의 backgroundThrottling=false 설정과 결합하여 백그라운드에서도 풀 속도
+  useEffect(() => {
+    if (!pdf || totalPages === 0) return;
+    // PDF 바뀌면 진행 기록 초기화
+    prerenderInFlightRef.current = new Set();
+    prerenderDoneRef.current = new Set();
+
+    let cancelled = false;
+    let cursor = 1;
+    const SLOTS = Math.max(1, Math.min(2, BODY_RENDER_CONCURRENCY - 1));
+
+    const pickNext = () => {
+      while (cursor <= totalPages) {
+        const p = cursor;
+        cursor += 1;
+        if (renderedPagesRef.current.has(p)) continue;
+        // 본문 렌더가 처리 중인 페이지는 건드리지 않음 (충돌 방지)
+        if (pageRenderTasksRef.current.has(p)) continue;
+        if (prerenderDoneRef.current.has(p)) continue;
+        if (prerenderInFlightRef.current.has(p)) continue;
+        return p;
+      }
+      return null;
+    };
+
+    const slotLoop = async () => {
+      while (!cancelled && document.hidden) {
+        const p = pickNext();
+        if (p == null) return;
+        prerenderInFlightRef.current.add(p);
+        try {
+          await renderPageToCache(p);
+          prerenderDoneRef.current.add(p);
+        } catch (_) {
+          prerenderDoneRef.current.add(p);
+        } finally {
+          prerenderInFlightRef.current.delete(p);
+        }
+      }
+    };
+
+    const startIfHidden = () => {
+      if (!document.hidden || cancelled) return;
+      // 매번 cursor를 처음으로 되돌려 미완료 페이지부터 다시 탐색
+      cursor = 1;
+      for (let i = 0; i < SLOTS; i++) {
+        void slotLoop();
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        startIfHidden();
+      }
+      // visible 상태가 되면 slotLoop의 while 조건이 false가 되어 자연 종료
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    // 이미 hidden 상태로 들어와 있다면 즉시 시작
+    if (document.hidden) startIfHidden();
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdf, totalPages, scale]);
 
   // 형광펜(자유+글자) 캔버스에 그리기
+  // - 현재 파일의 형광펜만 페이지별로 묶어 한 번에 그림
+  // - 보이는 페이지 + 인접 페이지만 우선 처리하여 대용량 PDF에서도 가벼움
+  const highlightsByPage = useMemo(() => {
+    const map = new Map();
+    if (!fileName) return map;
+    highlights.forEach((h) => {
+      if (h.fileName !== fileName) return;
+      if (!map.has(h.page)) map.set(h.page, []);
+      map.get(h.page).push(h);
+    });
+    return map;
+  }, [highlights, fileName]);
+
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
     if (!fileName) return;
 
-    for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+    const visible = visiblePagesRef.current;
+    const pagesToDraw = new Set();
+
+    if (visible.size > 0) {
+      visible.forEach((p) => {
+        pagesToDraw.add(p);
+        if (p > 1) pagesToDraw.add(p - 1);
+        if (p < totalPages) pagesToDraw.add(p + 1);
+      });
+    } else {
+      const around = 2;
+      const cp = currentPageRef.current || 1;
+      for (
+        let p = Math.max(1, cp - around);
+        p <= Math.min(totalPages, cp + around);
+        p++
+      ) {
+        pagesToDraw.add(p);
+      }
+    }
+
+    pagesToDraw.forEach((pageNum) => {
       const baseCanvas = canvasRefs.current[pageNum - 1];
       const highlightCanvas = highlightCanvasRefs.current[pageNum - 1];
-      if (!baseCanvas || !highlightCanvas) continue;
+      if (!baseCanvas || !highlightCanvas) return;
 
       const ctx = highlightCanvas.getContext("2d");
-      if (!ctx) continue;
+      if (!ctx) return;
 
       if (
         highlightCanvas.width !== baseCanvas.width ||
@@ -642,9 +1604,8 @@ export default function PdfViewerWithBookmarks() {
         ctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
       }
 
-      const pageHighlights = highlights.filter(
-        (h) => h.fileName === fileName && h.page === pageNum
-      );
+      const pageHighlights = highlightsByPage.get(pageNum);
+      if (!pageHighlights || pageHighlights.length === 0) return;
 
       pageHighlights.forEach((h) => {
         const x = h.x * highlightCanvas.width;
@@ -654,142 +1615,224 @@ export default function PdfViewerWithBookmarks() {
         ctx.fillStyle = h.color || DEFAULT_HIGHLIGHT_COLOR;
         ctx.fillRect(x, y, w, hgt);
       });
-    }
-  }, [highlights, pdf, totalPages, scale, fileName]);
+    });
+  }, [
+    highlightsByPage,
+    pdf,
+    totalPages,
+    scale,
+    fileName,
+    visiblePagesVersion,
+    currentPage,
+  ]);
 
   // PDF 로딩
-  const loadPdfFromArrayBuffer = async (
-    arrayBuffer,
-    name,
-    sourcePath = null,
-    initialPage = 1
-  ) => {
-    if (!arrayBuffer) return;
+  const loadPdfFromArrayBuffer = useCallback(
+    async (
+      arrayBuffer,
+      name,
+      sourcePath = null,
+      initialPage = 1,
+      options = {},
+    ) => {
+      if (!arrayBuffer) return null;
+      const makeActive = options.makeActive !== false; // 기본 true
 
-    const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    const cacheKey = sourcePath || name;
-    pdfCacheRef.current[cacheKey] = pdfDoc;
+      const docKey = makeDocKey({ filePath: sourcePath, fileName: name });
 
-    // ✅ 1페이지 높이를 미리 계산해서 저장 (모든 페이지의 min-height로 사용)
-    try {
-      const firstPage = await pdfDoc.getPage(1);
-      const firstViewport = firstPage.getViewport({ scale: INITIAL_SCALE });
-      basePageHeightRef.current = firstViewport.height;
-      baseScaleRef.current = INITIAL_SCALE;
-    } catch (e) {
-      console.warn("첫 페이지 높이 계산 실패:", e);
-      basePageHeightRef.current = null;
-    }
-
-    const total = pdfDoc.numPages;
-    const thumbnailsInit = new Array(total).fill(null);
-
-    let resolvedTabId = null;
-
-    setTabs((prev) => {
-      const byPath =
-        sourcePath != null ? prev.find((t) => t.filePath === sourcePath) : null;
-      const byName = prev.find((t) => t.fileName === name);
-      const existing = byPath || byName;
-
-      if (existing) {
-        resolvedTabId = existing.id;
-        return prev.map((t) =>
-          t.id === existing.id
-            ? {
-                ...t,
-                pdf: pdfDoc,
-                fileName: name,
-                filePath: sourcePath || t.filePath || null,
-                totalPages: total,
-                currentPage: initialPage,
-                pageInput: String(initialPage),
-                scale: INITIAL_SCALE,
-                thumbnails: thumbnailsInit,
-                pageTexts: [],
-                searchQuery: "",
-                searchMatches: [],
-                searchIndex: 0,
-              }
-            : t
-        );
+      // 1) 영구 캐시에서 페이지 메타 우선 로드 (이미 본 PDF면 layout 즉시 결정)
+      let cachedMeta = null;
+      try {
+        cachedMeta = await pdfCache.getDocMeta(docKey);
+      } catch (_) {
+        cachedMeta = null;
       }
 
-      const newId = `tab-${Date.now()}-${Math.random()}`;
-      resolvedTabId = newId;
+      // 2) PDF.js 파싱 (가장 무거운 단계)
+      let pdfDoc;
+      try {
+        pdfDoc = await pdfjsLib.getDocument({
+          data: arrayBuffer,
+          disableAutoFetch: true,
+          disableStream: false,
+        }).promise;
+      } catch (e) {
+        console.error("PDF 로딩 실패:", e);
+        alert(`PDF 파일을 여는 데 실패했습니다.\n${e?.message || e}`);
+        return null;
+      }
 
-      const newTab = {
-        id: newId,
-        fileName: name,
-        filePath: sourcePath,
-        pdf: pdfDoc,
-        totalPages: total,
-        currentPage: initialPage,
-        pageInput: String(initialPage),
-        scale: INITIAL_SCALE,
-        thumbnails: thumbnailsInit,
-        pageTexts: [],
-        searchQuery: "",
-        searchMatches: [],
-        searchIndex: 0,
-      };
+      const cacheKey = sourcePath || name;
+      const prevCached = pdfCacheRef.current[cacheKey];
+      if (prevCached && prevCached !== pdfDoc) {
+        try {
+          prevCached.destroy();
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      pdfCacheRef.current[cacheKey] = pdfDoc;
 
-      return [...prev, newTab];
-    });
+      const total = pdfDoc.numPages;
+      const thumbnailsInit = new Array(total).fill(null);
+      const newId = `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    if (!resolvedTabId) return;
+      // 3) 탭 추가/병합 - getPage(1) 기다리지 않고 즉시 UI 반영
+      let resolvedTabId = newId;
+      setTabs((prev) => {
+        const byPath =
+          sourcePath != null
+            ? prev.find((t) => t.filePath === sourcePath)
+            : null;
+        const byName = prev.find((t) => t.fileName === name);
+        const existing = byPath || byName;
 
-    setActiveTabId(resolvedTabId);
-    setFileName(name);
-    setFilePath(sourcePath || "");
-    setPdf(pdfDoc);
-    setTotalPages(total);
-    setCurrentPage(initialPage);
-    setPageInput(String(initialPage));
-    setScale(INITIAL_SCALE);
-    setThumbnails(thumbnailsInit);
-    setPageTexts([]);
-    setSearchQuery("");
-    setSearchMatches([]);
-    setSearchIndex(0);
+        if (existing) {
+          resolvedTabId = existing.id;
+          if (existing.pdf && existing.pdf !== pdfDoc) {
+            try {
+              existing.pdf.destroy();
+            } catch (_) {
+              /* ignore */
+            }
+          }
+          return prev.map((t) =>
+            t.id === existing.id
+              ? {
+                  ...t,
+                  pdf: pdfDoc,
+                  docKey,
+                  fileName: name,
+                  filePath: sourcePath || t.filePath || null,
+                  totalPages: total,
+                  currentPage: initialPage,
+                  pageInput: String(initialPage),
+                  scale: INITIAL_SCALE,
+                  thumbnails: thumbnailsInit,
+                  pageTexts: [],
+                  searchQuery: "",
+                  searchMatches: [],
+                  searchIndex: 0,
+                }
+              : t,
+          );
+        }
 
-    renderedPagesRef.current = new Set();
-  };
+        return [
+          ...prev,
+          {
+            id: newId,
+            fileName: name,
+            filePath: sourcePath,
+            docKey,
+            pdf: pdfDoc,
+            totalPages: total,
+            currentPage: initialPage,
+            pageInput: String(initialPage),
+            scale: INITIAL_SCALE,
+            thumbnails: thumbnailsInit,
+            pageTexts: [],
+            searchQuery: "",
+            searchMatches: [],
+            searchIndex: 0,
+          },
+        ];
+      });
 
-  const loadPdfFromPath = async (path, initialPage = 1) => {
-    if (!ipcRenderer || !path) return;
+      // 4) 활성화 여부에 따라 메인 뷰어 상태 갱신
+      //    (병렬 로드 시 첫 파일만 활성화하여 보이는 페이지를 빠르게 렌더)
+      if (makeActive) {
+        docKeyRef.current = docKey;
+        // 캐시된 메타가 있으면 즉시 사용해 PageContainer 크기 확정
+        if (cachedMeta?.basePageWidth && cachedMeta?.basePageHeight) {
+          docMetaRef.current = cachedMeta;
+          basePageHeightRef.current = cachedMeta.basePageHeight;
+          basePageWidthRef.current = cachedMeta.basePageWidth;
+          baseScaleRef.current = INITIAL_SCALE;
+        }
+        setActiveTabId(resolvedTabId);
+        setFileName(name);
+        setFilePath(sourcePath || "");
+        setPdf(pdfDoc);
+        setTotalPages(total);
+        setCurrentPage(initialPage);
+        setPageInput(String(initialPage));
+        setScale(INITIAL_SCALE);
+        setThumbnails(thumbnailsInit);
+        setPageTexts([]);
+        setSearchQuery("");
+        setSearchMatches([]);
+        setSearchIndex(0);
+        resetRenderState();
+      }
 
-    try {
-      const buffer = await ipcRenderer.invoke("read-pdf-file", path);
+      // 5) 백그라운드: 첫 페이지 viewport 정밀 계산 + 메타 캐시 갱신
+      //    UI는 이미 그려지고 있고, 정확한 사이즈가 들어오면 자연스럽게 보정됨
+      void (async () => {
+        try {
+          const firstPage = await pdfDoc.getPage(1);
+          const firstViewport = firstPage.getViewport({
+            scale: INITIAL_SCALE,
+            rotation: firstPage.rotate,
+          });
+          // 현재 활성 PDF가 이 PDF일 때만 base size 갱신
+          if (docKeyRef.current === docKey) {
+            basePageHeightRef.current = firstViewport.height;
+            basePageWidthRef.current = firstViewport.width;
+            baseScaleRef.current = INITIAL_SCALE;
+          }
+          const meta = {
+            totalPages: total,
+            basePageHeight: firstViewport.height,
+            basePageWidth: firstViewport.width,
+            baseScale: INITIAL_SCALE,
+            docKey,
+          };
+          if (docKeyRef.current === docKey) {
+            docMetaRef.current = meta;
+          }
+          pdfCache.setDocMeta(docKey, meta).catch(() => {});
+        } catch (_) {
+          /* ignore */
+        }
+      })();
 
-      const uint8 =
-        buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+      return resolvedTabId;
+    },
+    [],
+  );
 
-      const arrayBuffer = uint8.buffer.slice(
-        uint8.byteOffset,
-        uint8.byteOffset + uint8.byteLength
-      );
+  const loadPdfFromPath = useCallback(
+    async (filepath, initialPage = 1) => {
+      if (!ipcRenderer || !filepath) return;
 
-      const name = path.split(/[/\\]/).pop() || "PDF";
-      await loadPdfFromArrayBuffer(arrayBuffer, name, path, initialPage);
-    } catch (err) {
-      console.error("loadPdfFromPath 실패:", err);
-    }
-  };
+      try {
+        const buffer = await ipcRenderer.invoke("read-pdf-file", filepath);
 
-  const loadPdfFromFile = async (file) => {
-    if (!file) return;
-    const arrayBuffer = await file.arrayBuffer();
-    const sourcePath = file.path || null;
-    await loadPdfFromArrayBuffer(arrayBuffer, file.name, sourcePath, 1);
-  };
+        const uint8 =
+          buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
 
-  // 탭 선택
-  const handleSelectTab = (tabId) => {
-    const tab = tabs.find((t) => t.id === tabId);
+        const arrayBuffer = uint8.buffer.slice(
+          uint8.byteOffset,
+          uint8.byteOffset + uint8.byteLength,
+        );
+
+        const name = filepath.split(/[/\\]/).pop() || "PDF";
+        await loadPdfFromArrayBuffer(arrayBuffer, name, filepath, initialPage);
+      } catch (err) {
+        console.error("loadPdfFromPath 실패:", err);
+        alert(
+          `PDF 파일을 여는 데 실패했습니다.\n경로: ${filepath}\n${err?.message || ""}`,
+        );
+      }
+    },
+    [loadPdfFromArrayBuffer],
+  );
+
+  // 탭 상태에서 메인 뷰어 상태를 동기화
+  const applyTabState = useCallback((tab) => {
     if (!tab) return;
-
-    setActiveTabId(tabId);
+    setActiveTabId(tab.id);
     setFileName(tab.fileName || "");
     setFilePath(tab.filePath || "");
     setPdf(tab.pdf || null);
@@ -797,70 +1840,65 @@ export default function PdfViewerWithBookmarks() {
     setCurrentPage(tab.currentPage || 1);
     setPageInput(tab.pageInput || String(tab.currentPage || 1));
     setScale(tab.scale || INITIAL_SCALE);
-    setThumbnails(
-      tab.thumbnails ||
-        (tab.totalPages ? new Array(tab.totalPages).fill(null) : [])
-    );
+    const baseThumbs =
+      tab.thumbnails && tab.thumbnails.length > 0
+        ? tab.thumbnails
+        : tab.totalPages
+          ? new Array(tab.totalPages).fill(null)
+          : [];
+    setThumbnails(baseThumbs);
     setPageTexts(tab.pageTexts || []);
     setSearchQuery(tab.searchQuery || "");
     setSearchMatches(tab.searchMatches || []);
     setSearchIndex(tab.searchIndex || 0);
+    docKeyRef.current =
+      tab.docKey ||
+      (tab.filePath || tab.fileName
+        ? makeDocKey({ filePath: tab.filePath, fileName: tab.fileName })
+        : null);
+    resetRenderState();
+  }, []);
 
-    if (tab.pdf) {
-      if (!tab.thumbnails || tab.thumbnails.every((t) => !t)) {
-        setThumbnails(new Array(tab.pdf.numPages).fill(null));
-      }
-    }
+  // 탭 선택
+  const handleSelectTab = useCallback(
+    (tabId) => {
+      const tab = tabs.find((t) => t.id === tabId);
+      if (!tab) return;
+      applyTabState(tab);
+    },
+    [tabs, applyTabState],
+  );
 
-    renderedPagesRef.current = new Set();
-  };
+  // 탭 닫기 (setState 콜백 안에서 다른 setState를 호출하지 않음)
+  const handleCloseTab = useCallback(
+    (tabId) => {
+      const idx = tabs.findIndex((t) => t.id === tabId);
+      if (idx === -1) return;
 
-  // 탭 닫기
-  const handleCloseTab = (tabId) => {
-    setTabs((prev) => {
-      const idx = prev.findIndex((t) => t.id === tabId);
-      if (idx === -1) return prev;
-
-      const newTabs = [...prev];
-      newTabs.splice(idx, 1);
-
+      const closingTab = tabs[idx];
       const closingActive = tabId === activeTabId;
+      const newTabs = tabs.slice(0, idx).concat(tabs.slice(idx + 1));
+      const newActive = closingActive
+        ? newTabs[idx] || newTabs[idx - 1] || null
+        : null;
+
+      setTabs(newTabs);
+
+      if (closingTab?.pdf) {
+        try {
+          closingTab.pdf.destroy();
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      const cacheKey = closingTab?.filePath || closingTab?.fileName;
+      if (cacheKey && pdfCacheRef.current[cacheKey]) {
+        delete pdfCacheRef.current[cacheKey];
+      }
 
       if (closingActive) {
-        const newActive = newTabs[idx] || newTabs[idx - 1] || null;
-
         if (newActive) {
-          setActiveTabId(newActive.id);
-          setFileName(newActive.fileName || "");
-          setFilePath(newActive.filePath || "");
-          setPdf(newActive.pdf || null);
-          setTotalPages(newActive.totalPages || 0);
-          setCurrentPage(newActive.currentPage || 1);
-          setPageInput(
-            newActive.pageInput || String(newActive.currentPage || 1)
-          );
-          setScale(newActive.scale || INITIAL_SCALE);
-          setThumbnails(
-            newActive.thumbnails ||
-              (newActive.totalPages
-                ? new Array(newActive.totalPages).fill(null)
-                : [])
-          );
-          setPageTexts(newActive.pageTexts || []);
-          setSearchQuery(newActive.searchQuery || "");
-          setSearchMatches(newActive.searchMatches || []);
-          setSearchIndex(newActive.searchIndex || 0);
-
-          if (newActive.pdf) {
-            if (
-              !newActive.thumbnails ||
-              newActive.thumbnails.every((t) => !t)
-            ) {
-              setThumbnails(new Array(newActive.pdf.numPages).fill(null));
-            }
-          }
-
-          renderedPagesRef.current = new Set();
+          applyTabState(newActive);
         } else {
           setActiveTabId(null);
           setFileName("");
@@ -875,20 +1913,56 @@ export default function PdfViewerWithBookmarks() {
           setSearchQuery("");
           setSearchMatches([]);
           setSearchIndex(0);
-          renderedPagesRef.current = new Set();
+          resetRenderState();
         }
       }
+    },
+    [tabs, activeTabId, applyTabState],
+  );
 
-      return newTabs;
-    });
-  };
+  // 🔹 여러 파일을 병렬로 로드 (첫 파일만 active, 나머지는 백그라운드 탭)
+  const loadFilesParallel = useCallback(
+    async (files) => {
+      const pdfFiles = files.filter(
+        (f) =>
+          f.type === "application/pdf" ||
+          f.name.toLowerCase().endsWith(".pdf"),
+      );
+      if (pdfFiles.length === 0) return;
 
-  // 파일 열기
-  const handleFile = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await loadPdfFromFile(file);
-  };
+      // arrayBuffer 변환은 빠르게 병렬 처리
+      const buffers = await Promise.all(
+        pdfFiles.map(async (f) => ({
+          buf: await f.arrayBuffer().catch(() => null),
+          name: f.name,
+          path: f.path || null,
+        })),
+      );
+
+      // 모든 PDF를 병렬로 파싱. 첫 번째 파일만 active로
+      await Promise.allSettled(
+        buffers.map(({ buf, name, path }, idx) => {
+          if (!buf) return Promise.resolve();
+          return loadPdfFromArrayBuffer(buf, name, path, 1, {
+            makeActive: idx === 0,
+          });
+        }),
+      );
+    },
+    [loadPdfFromArrayBuffer],
+  );
+
+  // 파일 열기 (input) - 다중 선택 + 병렬 로딩
+  const handleFile = useCallback(
+    async (e) => {
+      const files = Array.from(e.target.files || []);
+      if (files.length === 0) return;
+      await loadFilesParallel(files);
+      // 같은 파일을 다시 선택할 수 있도록 input 초기화
+      e.target.value = "";
+    },
+    [loadFilesParallel],
+  );
 
   // 🔹 컨테이너 드래그
   const handleDragOver = (e) => {
@@ -911,19 +1985,27 @@ export default function PdfViewerWithBookmarks() {
     e.preventDefault();
     setIsDragOver(false);
 
-    const file = e.dataTransfer.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.dataTransfer?.files || []);
+    if (files.length === 0) return;
 
-    const isPdf =
-      file.type === "application/pdf" ||
-      file.name.toLowerCase().endsWith(".pdf");
+    const pdfFiles = files.filter(
+      (f) =>
+        f.type === "application/pdf" ||
+        f.name.toLowerCase().endsWith(".pdf"),
+    );
 
-    if (!isPdf) {
+    if (pdfFiles.length === 0) {
       alert("PDF 파일만 열 수 있습니다.");
       return;
     }
+    if (pdfFiles.length < files.length) {
+      console.warn(
+        `${files.length - pdfFiles.length}개 파일이 PDF가 아니어서 제외됨`,
+      );
+    }
 
-    await loadPdfFromFile(file);
+    // 병렬 로딩: 첫 파일만 active로 만들어 즉시 보이고, 나머지는 백그라운드에서 탭만 추가
+    await loadFilesParallel(pdfFiles);
   };
 
   const handleDragEnter = (e) => {
@@ -935,45 +2017,90 @@ export default function PdfViewerWithBookmarks() {
     setIsDragOver(true);
   };
 
-  // 페이지 텍스트 추출
+  // 페이지 텍스트 캐시 (검색 시점에 지연 추출하여 큰 PDF의 초기 응답성 개선)
+  // 추가: 렌더 캐시에 textLayer가 있으면 그 결과를 텍스트로 활용
+  const pageTextsCacheRef = useRef(new Map());
   useEffect(() => {
-    if (!pdf || totalPages === 0) {
-      setPageTexts([]);
-      return;
-    }
+    pageTextsCacheRef.current = new Map();
+    setPageTexts([]);
+  }, [pdf]);
 
-    let cancelled = false;
+  const extractPageText = useCallback(
+    async (pageNum) => {
+      const cache = pageTextsCacheRef.current;
+      if (cache.has(pageNum)) return cache.get(pageNum);
 
-    const extractTexts = async () => {
-      const texts = [];
-      for (let i = 1; i <= totalPages; i++) {
-        if (cancelled) return;
+      // 1) 렌더 캐시의 textLayer에서 빠르게 합치기
+      const docKey = docKeyRef.current;
+      if (docKey) {
         try {
-          const page = await pdf.getPage(i);
-          const textContent = await page.getTextContent();
-          let fullText = "";
-          textContent.items.forEach((item) => {
-            const str = item.str || "";
-            if (!str) return;
-            if (fullText) fullText += " ";
-            fullText += str;
-          });
-          texts.push(fullText);
-        } catch (e) {
-          texts.push("");
+          const outputScale = getOutputScale();
+          // 가장 흔한 INITIAL_SCALE 키부터 시도 (대표 캐시)
+          const candidates = [scale, INITIAL_SCALE, 1, 2];
+          const tried = new Set();
+          for (const s of candidates) {
+            if (tried.has(s)) continue;
+            tried.add(s);
+            const key = makeRenderKey(docKey, pageNum, s, outputScale);
+            const cached = await pdfCache.getRender(key);
+            if (cached?.textLayer && Array.isArray(cached.textLayer)) {
+              let fullText = "";
+              for (const d of cached.textLayer) {
+                if (!d?.text) continue;
+                if (fullText) fullText += " ";
+                fullText += d.text;
+              }
+              cache.set(pageNum, fullText);
+              return fullText;
+            }
+          }
+        } catch (_) {
+          /* ignore */
         }
       }
-      if (!cancelled) {
-        setPageTexts(texts);
+
+      // 2) PDF.js로 추출
+      if (!pdf) return "";
+      try {
+        const page = await pdf.getPage(pageNum);
+        const textContent = await page.getTextContent();
+        let fullText = "";
+        const items = textContent.items || [];
+        for (let k = 0; k < items.length; k++) {
+          const str = items[k].str || "";
+          if (!str) continue;
+          if (fullText) fullText += " ";
+          fullText += str;
+        }
+        cache.set(pageNum, fullText);
+        return fullText;
+      } catch (_) {
+        cache.set(pageNum, "");
+        return "";
       }
-    };
+    },
+    [pdf, scale],
+  );
 
-    extractTexts();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [pdf, totalPages]);
+  // 검색 시: 모든 페이지 텍스트를 청크 단위로 병렬 추출 (캐시 활용)
+  const ensureAllPageTexts = useCallback(async () => {
+    if (!pdf || totalPages === 0) return [];
+    const cache = pageTextsCacheRef.current;
+    const missing = [];
+    for (let i = 1; i <= totalPages; i++) {
+      if (!cache.has(i)) missing.push(i);
+    }
+    const CHUNK = 8;
+    for (let start = 0; start < missing.length; start += CHUNK) {
+      const batch = missing.slice(start, start + CHUNK);
+      await Promise.all(batch.map((p) => extractPageText(p)));
+    }
+    const result = new Array(totalPages);
+    for (let i = 1; i <= totalPages; i++) {
+      result[i - 1] = cache.get(i) || "";
+    }
+    return result;
+  }, [pdf, totalPages, extractPageText]);
 
   // OS에서 처음 열린 PDF
   useEffect(() => {
@@ -981,9 +2108,9 @@ export default function PdfViewerWithBookmarks() {
 
     const openInitialPdf = async () => {
       try {
-        const path = await ipcRenderer.invoke("get-initial-pdf-path");
-        if (path) {
-          await loadPdfFromPath(path, 1);
+        const filepath = await ipcRenderer.invoke("get-initial-pdf-path");
+        if (filepath) {
+          await loadPdfFromPath(filepath, 1);
         }
       } catch (err) {
         console.error("초기 PDF 로드 실패:", err);
@@ -991,15 +2118,15 @@ export default function PdfViewerWithBookmarks() {
     };
 
     openInitialPdf();
-  }, []);
+  }, [loadPdfFromPath]);
 
   // 실행 중 다른 PDF 열기
   useEffect(() => {
     if (!ipcRenderer) return;
 
-    const handler = (_event, path) => {
-      if (path) {
-        loadPdfFromPath(path, 1);
+    const handler = (_event, filepath) => {
+      if (filepath) {
+        loadPdfFromPath(filepath, 1);
       }
     };
 
@@ -1008,110 +2135,190 @@ export default function PdfViewerWithBookmarks() {
     return () => {
       ipcRenderer.removeListener("open-pdf-from-os", handler);
     };
-  }, []);
+  }, [loadPdfFromPath]);
 
-  const handleScroll = () => {
-    // currentPage 업데이트는 IntersectionObserver에서 처리
-  };
-
-  // Ctrl+휠 줌
-  const handleWheel = (e) => {
-    if (!e.ctrlKey) return;
-
-    if (e.cancelable) {
-      e.preventDefault();
-    }
-
+  // 🔹 스크롤 중 표시 (passive scroll listener로 부담 최소화)
+  useEffect(() => {
     const container = mainRef.current;
     if (!container) return;
 
-    const clientY = e.clientY;
-    const canvases = canvasRefs.current;
-    let targetIndex = -1;
-    let minDist = Infinity;
+    const onScroll = () => {
+      isScrollingRef.current = true;
+      if (scrollSettleTimerRef.current) {
+        clearTimeout(scrollSettleTimerRef.current);
+      }
+      // 스크롤이 멈춘 후 120ms 뒤 settle로 간주하여 렌더 워커 깨우기
+      scrollSettleTimerRef.current = setTimeout(() => {
+        isScrollingRef.current = false;
+        // 렌더 effect 재실행을 위해 visiblePagesVersion 증가
+        setVisiblePagesVersion((v) => v + 1);
+      }, 120);
+    };
 
-    canvases.forEach((canvas, idx) => {
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
+    container.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      container.removeEventListener("scroll", onScroll);
+      if (scrollSettleTimerRef.current) {
+        clearTimeout(scrollSettleTimerRef.current);
+        scrollSettleTimerRef.current = null;
+      }
+    };
+  }, []);
 
-      if (clientY >= rect.top && clientY <= rect.bottom) {
-        if (0 < minDist) {
-          minDist = 0;
+  // Ctrl+휠 줌 (passive 회피용: native listener로 등록)
+  const scaleRef = useRef(scale);
+  useEffect(() => {
+    scaleRef.current = scale;
+  }, [scale]);
+
+  useEffect(() => {
+    const container = mainRef.current;
+    if (!container) return;
+
+    const onWheel = (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+
+      const clientY = e.clientY;
+      const canvases = canvasRefs.current;
+      let targetIndex = -1;
+      let minDist = Infinity;
+
+      for (let idx = 0; idx < canvases.length; idx++) {
+        const canvas = canvases[idx];
+        if (!canvas) continue;
+        const rect = canvas.getBoundingClientRect();
+
+        if (clientY >= rect.top && clientY <= rect.bottom) {
           targetIndex = idx;
+          minDist = 0;
+          break;
         }
-      } else {
         const dist = Math.min(
           Math.abs(clientY - rect.top),
-          Math.abs(clientY - rect.bottom)
+          Math.abs(clientY - rect.bottom),
         );
         if (dist < minDist) {
           targetIndex = idx;
           minDist = dist;
         }
       }
-    });
 
-    if (targetIndex === -1) return;
+      if (targetIndex === -1) return;
 
-    const targetCanvas = canvases[targetIndex];
-    const pageRect = targetCanvas.getBoundingClientRect();
-    const relY = (clientY - pageRect.top) / pageRect.height;
+      const targetCanvas = canvases[targetIndex];
+      const pageRect = targetCanvas.getBoundingClientRect();
+      const relY = (clientY - pageRect.top) / pageRect.height;
 
-    const prevScale = scale;
-    const isZoomOut = e.deltaY > 0;
+      const prevScale = scaleRef.current;
+      const isZoomOut = e.deltaY > 0;
+      const nextScale = isZoomOut
+        ? Math.max(prevScale - SCALE_STEP, MIN_SCALE)
+        : Math.min(prevScale + SCALE_STEP, MAX_SCALE);
 
-    let nextScale = isZoomOut
-      ? Math.max(prevScale - SCALE_STEP, MIN_SCALE)
-      : Math.min(prevScale + SCALE_STEP, MAX_SCALE);
+      if (nextScale === prevScale) return;
 
-    if (nextScale === prevScale) return;
+      setScale(nextScale);
 
-    setScale(nextScale);
+      const savedRelY = relY;
+      const savedTargetIndex = targetIndex;
 
-    const savedRelY = relY;
-    const savedTargetIndex = targetIndex;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          const c = mainRef.current;
+          const canvasAfter = canvasRefs.current[savedTargetIndex];
+          if (!c || !canvasAfter) return;
 
-    const adjustScroll = () => {
-      const c = mainRef.current;
-      const canvasAfter = canvasRefs.current[savedTargetIndex];
-      if (!c || !canvasAfter) return;
+          const rectAfter = canvasAfter.getBoundingClientRect();
+          const clampedRelY = Math.min(Math.max(savedRelY, 0), 1);
+          const targetY = rectAfter.top + clampedRelY * rectAfter.height;
+          const delta = targetY - clientY;
 
-      const rectAfter = canvasAfter.getBoundingClientRect();
-      const clampedRelY = Math.min(Math.max(savedRelY, 0), 1);
+          let newScrollTop = c.scrollTop + delta;
+          const maxScrollTop = c.scrollHeight - c.clientHeight;
+          if (newScrollTop < 0) newScrollTop = 0;
+          if (newScrollTop > maxScrollTop) newScrollTop = maxScrollTop;
 
-      const targetY = rectAfter.top + clampedRelY * rectAfter.height;
-      const delta = targetY - clientY;
-
-      let newScrollTop = c.scrollTop + delta;
-      const maxScrollTop = c.scrollHeight - c.clientHeight;
-
-      if (newScrollTop < 0) newScrollTop = 0;
-      if (newScrollTop > maxScrollTop) newScrollTop = maxScrollTop;
-
-      c.scrollTop = newScrollTop;
+          c.scrollTop = newScrollTop;
+        });
+      });
     };
 
-    requestAnimationFrame(() => {
-      requestAnimationFrame(adjustScroll);
-    });
-  };
+    container.addEventListener("wheel", onWheel, { passive: false });
+    return () => container.removeEventListener("wheel", onWheel);
+  }, []);
 
-  // IntersectionObserver로 현재 페이지 업데이트
+  // IntersectionObserver로 현재 페이지 + 보이는 페이지 추적
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
     if (!mainRef.current) return;
 
     const root = mainRef.current;
+    let visibleScheduled = false;
+    const scheduleVisibleUpdate = () => {
+      if (visibleScheduled) return;
+      visibleScheduled = true;
+      requestAnimationFrame(() => {
+        visibleScheduled = false;
+        setVisiblePagesVersion((v) => v + 1);
+      });
+    };
+
+    // 현재 페이지 추적도 별도 rAF로 코얼레싱 (스크롤마다 setState 폭주 방지)
+    let pageScheduled = false;
+    let pendingBestPage = null;
+    const scheduleCurrentPageUpdate = () => {
+      if (pageScheduled) return;
+      pageScheduled = true;
+      requestAnimationFrame(() => {
+        pageScheduled = false;
+        if (
+          pendingBestPage != null &&
+          pendingBestPage !== currentPageRef.current
+        ) {
+          setCurrentPage(pendingBestPage);
+        }
+        pendingBestPage = null;
+      });
+    };
 
     const observer = new IntersectionObserver(
       (entries) => {
-        let bestPage = currentPageRef.current;
-        let bestRatio = 0;
+        const container = mainRef.current;
+        if (!container) return;
 
+        let visibleChanged = false;
         entries.forEach((entry) => {
           const pageNum = Number(entry.target.dataset.page);
           if (!pageNum) return;
 
+          if (entry.isIntersecting) {
+            if (!visiblePagesRef.current.has(pageNum)) {
+              visiblePagesRef.current.add(pageNum);
+              visibleChanged = true;
+            }
+          } else {
+            if (visiblePagesRef.current.delete(pageNum)) {
+              visibleChanged = true;
+            }
+          }
+        });
+        if (visibleChanged) scheduleVisibleUpdate();
+
+        const bottomGap =
+          container.scrollHeight - container.scrollTop - container.clientHeight;
+
+        if (bottomGap <= 8) {
+          pendingBestPage = totalPages;
+          scheduleCurrentPageUpdate();
+          return;
+        }
+
+        let bestPage = currentPageRef.current;
+        let bestRatio = 0;
+        entries.forEach((entry) => {
+          const pageNum = Number(entry.target.dataset.page);
+          if (!pageNum) return;
           const ratio = entry.intersectionRatio;
           if (ratio > bestRatio) {
             bestRatio = ratio;
@@ -1119,14 +2326,17 @@ export default function PdfViewerWithBookmarks() {
           }
         });
 
-        if (bestRatio > 0 && bestPage !== currentPageRef.current) {
-          setCurrentPage(bestPage);
+        if (bestRatio > 0) {
+          pendingBestPage = bestPage;
+          scheduleCurrentPageUpdate();
         }
       },
       {
         root,
-        threshold: [0.3, 0.5, 0.7],
-      }
+        rootMargin: "200px 0px 200px 0px",
+        // threshold 개수를 줄여 스크롤 중 콜백 발화 빈도를 낮춤
+        threshold: [0, 0.5],
+      },
     );
 
     pageContainerRefs.current.forEach((el) => {
@@ -1135,96 +2345,140 @@ export default function PdfViewerWithBookmarks() {
 
     return () => {
       observer.disconnect();
+      visiblePagesRef.current = new Set();
     };
   }, [pdf, totalPages]);
 
   // 북마크
-  const toggleBookmarkPage = (pageNum) => {
-    if (!fileName) return;
-    const key = `${fileName}-${pageNum}`;
+  const toggleBookmarkPage = useCallback(
+    (pageNum) => {
+      if (!fileName) return;
+      const key = `${fileName}-${pageNum}`;
 
-    setBookmarks((prev) => {
-      const exists = prev.some((b) => b.key === key);
-      if (exists) {
-        return prev.filter((b) => b.key !== key);
-      }
-
-      const newBookmark = {
-        key,
-        fileName,
-        filePath: filePath || null,
-        page: pageNum,
-        date: new Date().toLocaleString(),
-        label: "",
-        folderId: null,
-      };
-      return [...prev, newBookmark];
-    });
-  };
+      setBookmarks((prev) => {
+        const exists = prev.some((b) => b.key === key);
+        if (exists) return prev.filter((b) => b.key !== key);
+        return [
+          ...prev,
+          {
+            key,
+            fileName,
+            filePath: filePath || null,
+            page: pageNum,
+            date: new Date().toLocaleString(),
+            label: "",
+            folderId: null,
+          },
+        ];
+      });
+    },
+    [fileName, filePath],
+  );
 
   // 스크롤로 페이지 이동
-  const scrollToPage = (pageNum) => {
+  const scrollToPage = useCallback((pageNum) => {
     const canvas = canvasRefs.current[pageNum - 1];
     const container = mainRef.current;
     const toolbar = toolbarRef.current;
 
-    if (canvas && container) {
-      const toolbarHeight = toolbar ? toolbar.offsetHeight : 0;
+    if (!canvas || !container) return;
+    const toolbarHeight = toolbar ? toolbar.offsetHeight : 0;
 
-      let offsetTop = 0;
-      let el = canvas;
-
-      while (el && el !== container) {
-        offsetTop += el.offsetTop;
-        el = el.offsetParent;
-      }
-
-      container.scrollTo({
-        top: offsetTop - toolbarHeight - 10,
-        behavior: "smooth",
-      });
+    let offsetTop = 0;
+    let el = canvas;
+    while (el && el !== container) {
+      offsetTop += el.offsetTop;
+      el = el.offsetParent;
     }
-  };
 
-  // ✅ 페이지 높이 추정값 (1페이지 높이 기준, scale에 따라 변경)
+    container.scrollTo({
+      top: offsetTop - toolbarHeight - 10,
+      behavior: "smooth",
+    });
+  }, []);
+
+  // ✅ 페이지 추정 높이/너비 (1페이지 기준, scale에 따라 변경)
   const estimatedPageHeight =
     basePageHeightRef.current && baseScaleRef.current
       ? (basePageHeightRef.current * scale) / baseScaleRef.current
       : null;
+  const estimatedPageWidth =
+    basePageWidthRef.current && baseScaleRef.current
+      ? (basePageWidthRef.current * scale) / baseScaleRef.current
+      : null;
 
   // 🔹 페이지 점프 시: 현재 페이지 + 주변 페이지 즉시 렌더
-  const jumpToPage = (pageNum) => {
-    if (!totalPages || !pdf) return;
-    const target =
-      pageNum < 1 ? 1 : pageNum > totalPages ? totalPages : pageNum;
+  const jumpToPage = useCallback(
+    (pageNum) => {
+      if (!totalPages || !pdf) return;
+      const target =
+        pageNum < 1 ? 1 : pageNum > totalPages ? totalPages : pageNum;
 
-    setCurrentPage(target);
-    scrollToPage(target);
+      const cp = currentPageRef.current || 1;
+      const isFar = Math.abs(target - cp) > KEEP_RENDERED_RANGE;
 
-    (async () => {
-      try {
+      // 1) target/인접 외 진행 중인 렌더 작업을 즉시 취소
+      //    → PDF.js 워커가 곧장 target 페이지를 처리할 수 있음
+      const keepRendering = new Set([target, target - 1, target + 1]);
+      cancelRenderTasksExcept(keepRendering);
+
+      // 2) 멀리 점프인 경우 보이지 않게 된 페이지의 캔버스 픽셀 즉시 해제
+      if (isFar) {
+        const toRelease = [];
+        renderedPagesRef.current.forEach((p) => {
+          if (Math.abs(p - target) > KEEP_RENDERED_RANGE) toRelease.push(p);
+        });
+        toRelease.forEach((p) => releasePageMemory(p));
+      }
+
+      // 3) 윈도잉 useEffect가 즉시 새 중심으로 돌도록 보이는 페이지 갱신
+      visiblePagesRef.current = new Set([target]);
+      setCurrentPage(target);
+      scrollToPage(target);
+
+      // 4) 즉시 시각 피드백: 썸네일을 캔버스에 흐릿하게 미리 그려둠
+      //    (실제 본문 렌더가 완료되면 자연스럽게 덮어쓰임)
+      drawPreviewFromThumb(target);
+      if (target - 1 >= 1) drawPreviewFromThumb(target - 1);
+      if (target + 1 <= totalPages) drawPreviewFromThumb(target + 1);
+
+      // 5) 사이드바 썸네일이 비어 있으면 우선 생성 요청
+      if (!thumbDoneRef.current.has(target)) requestThumbnail(target);
+
+      // 6) 우선 렌더 — target/인접 3페이지를 병렬로 시작
+      (async () => {
         const pagesToRender = [target, target - 1, target + 1].filter(
           (p, idx, arr) =>
             p >= 1 &&
             p <= totalPages &&
             arr.indexOf(p) === idx &&
-            !renderedPagesRef.current.has(p)
+            !renderedPagesRef.current.has(p),
         );
+        if (pagesToRender.length === 0) return;
 
-        for (const p of pagesToRender) {
-          await renderPage(p, scale);
-          renderedPagesRef.current.add(p);
+        const generationAtStart = renderGenerationRef.current;
+        try {
+          await Promise.allSettled(
+            pagesToRender.map((p) =>
+              renderPage(p, scale).then((ok) => {
+                if (ok && generationAtStart === renderGenerationRef.current) {
+                  renderedPagesRef.current.add(p);
+                }
+              }),
+            ),
+          );
+        } catch (err) {
+          console.error("priority render 실패:", err);
         }
-      } catch (err) {
-        console.error("priority render 실패:", err);
-      }
-    })();
-  };
+      })();
+    },
+    [pdf, totalPages, scale, scrollToPage, requestThumbnail],
+  );
 
   // 북마크로 이동
-  const goToBookmark = async (bm) => {
+  const goToBookmark = useCallback(async (bm) => {
     const targetTab = tabs.find((t) =>
-      bm.filePath ? t.filePath === bm.filePath : t.fileName === bm.fileName
+      bm.filePath ? t.filePath === bm.filePath : t.fileName === bm.fileName,
     );
     if (targetTab) {
       handleSelectTab(targetTab.id);
@@ -1271,7 +2525,7 @@ export default function PdfViewerWithBookmarks() {
         setSearchMatches([]);
         setSearchIndex(0);
 
-        renderedPagesRef.current = new Set();
+        resetRenderState();
 
         setTimeout(() => {
           jumpToPage(bm.page);
@@ -1284,29 +2538,29 @@ export default function PdfViewerWithBookmarks() {
           }, 200);
         } catch (e) {
           alert(
-            `PDF 파일을 다시 여는 데 실패했습니다.\n경로: ${bm.filePath}\n파일이 옮겨졌는지 / 삭제되지 않았는지 확인해주세요.`
+            `PDF 파일을 다시 여는 데 실패했습니다.\n경로: ${bm.filePath}\n파일이 옮겨졌는지 / 삭제되지 않았는지 확인해주세요.`,
           );
         }
       } else {
         alert(
-          `이 북마크의 PDF("${bm.fileName}") 정보를 찾을 수 없습니다.\n파일을 직접 다시 열어주세요.`
+          `이 북마크의 PDF("${bm.fileName}") 정보를 찾을 수 없습니다.\n파일을 직접 다시 열어주세요.`,
         );
       }
     }
-  };
+  }, [tabs, handleSelectTab, jumpToPage, loadPdfFromPath]);
 
   // 줌
-  const handleZoomIn = () => {
+  const handleZoomIn = useCallback(() => {
     setScale((prev) => Math.min(prev + SCALE_STEP, MAX_SCALE));
-  };
+  }, []);
 
-  const handleZoomOut = () => {
+  const handleZoomOut = useCallback(() => {
     setScale((prev) => Math.max(prev - SCALE_STEP, MIN_SCALE));
-  };
+  }, []);
 
-  const handleResetZoom = () => {
+  const handleResetZoom = useCallback(() => {
     setScale(ACTUAL_SIZE_SCALE);
-  };
+  }, []);
 
   // 지우개: 좌표에 걸린 형광펜 한 개만 삭제
   const eraseHighlightAtPoint = (pageNum, e) => {
@@ -1528,89 +2782,120 @@ export default function PdfViewerWithBookmarks() {
     selection.removeAllRanges();
   };
 
-  // 텍스트 검색
-  const handleSearch = () => {
+  // 텍스트 검색 (검색 시점에 텍스트 추출)
+  const isSearchingRef = useRef(false);
+  const handleSearch = useCallback(async () => {
     const q = searchQuery.trim();
-    if (!q || pageTexts.length === 0) {
+    if (!q) {
       setSearchMatches([]);
       setSearchIndex(0);
-
       for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-        applySearchHighlightForPage(pageNum);
+        applySearchHighlightForPage(pageNum, "");
       }
       return;
     }
+    if (isSearchingRef.current) return;
+    isSearchingRef.current = true;
 
-    const lowerQ = q.toLowerCase();
-    const matches = [];
-
-    pageTexts.forEach((text, idx) => {
-      if (!text) return;
-      const lowerText = text.toLowerCase();
-      let pos = lowerText.indexOf(lowerQ);
-      while (pos !== -1) {
-        matches.push({
-          page: idx + 1,
-          start: pos,
-          end: pos + q.length,
-        });
-        pos = lowerText.indexOf(lowerQ, pos + q.length);
+    try {
+      const texts = await ensureAllPageTexts();
+      if (texts.length === 0) {
+        setSearchMatches([]);
+        setSearchIndex(0);
+        return;
       }
-    });
+      setPageTexts(texts);
 
-    setSearchMatches(matches);
-    if (matches.length > 0) {
+      const lowerQ = q.toLowerCase();
+      const matches = [];
+      texts.forEach((text, idx) => {
+        if (!text) return;
+        const lowerText = text.toLowerCase();
+        let pos = lowerText.indexOf(lowerQ);
+        while (pos !== -1) {
+          matches.push({
+            page: idx + 1,
+            start: pos,
+            end: pos + q.length,
+          });
+          pos = lowerText.indexOf(lowerQ, pos + q.length);
+        }
+      });
+
+      setSearchMatches(matches);
       setSearchIndex(0);
-      jumpToPage(matches[0].page);
-    } else {
-      setSearchIndex(0);
+      if (matches.length > 0) jumpToPage(matches[0].page);
+    } finally {
+      isSearchingRef.current = false;
     }
-  };
+  }, [
+    searchQuery,
+    totalPages,
+    ensureAllPageTexts,
+    applySearchHighlightForPage,
+    jumpToPage,
+  ]);
 
-  // 검색어 변경 시 DOM 원복
+  // 검색어 변경 시: DOM 원복 + 보이는 페이지에 즉시 하이라이트 반영
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
-    if (searchQuery.trim() === "") {
+
+    const q = searchQuery.trim();
+    if (q === "") {
       setSearchMatches([]);
       setSearchIndex(0);
-      for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-        applySearchHighlightForPage(pageNum);
+    }
+
+    const pages = visiblePagesRef.current;
+    if (pages.size > 0) {
+      pages.forEach((p) => applySearchHighlightForPage(p, q));
+    } else {
+      const cp = currentPageRef.current || 1;
+      const around = 2;
+      for (
+        let p = Math.max(1, cp - around);
+        p <= Math.min(totalPages, cp + around);
+        p++
+      ) {
+        applySearchHighlightForPage(p, q);
       }
     }
-  }, [searchQuery, pdf, totalPages]);
+  }, [
+    searchQuery,
+    pdf,
+    totalPages,
+    visiblePagesVersion,
+    applySearchHighlightForPage,
+  ]);
 
-  const gotoMatch = (nextIndex) => {
-    if (searchMatches.length === 0) return;
-    const len = searchMatches.length;
-    let idx = ((nextIndex % len) + len) % len;
-    setSearchIndex(idx);
-    const match = searchMatches[idx];
-    jumpToPage(match.page);
-  };
+  const gotoMatch = useCallback(
+    (nextIndex) => {
+      if (searchMatches.length === 0) return;
+      const len = searchMatches.length;
+      const idx = ((nextIndex % len) + len) % len;
+      setSearchIndex(idx);
+      jumpToPage(searchMatches[idx].page);
+    },
+    [searchMatches, jumpToPage],
+  );
 
   const hasSearchResults = searchMatches.length > 0;
   const pdfLoaded = !!pdf;
 
-  const handlePrevPage = () => {
-    if (currentPage > 1) {
-      jumpToPage(currentPage - 1);
-    }
-  };
+  const handlePrevPage = useCallback(() => {
+    if (currentPage > 1) jumpToPage(currentPage - 1);
+  }, [currentPage, jumpToPage]);
 
-  const handleNextPage = () => {
-    if (currentPage < totalPages) {
-      jumpToPage(currentPage + 1);
-    }
-  };
+  const handleNextPage = useCallback(() => {
+    if (currentPage < totalPages) jumpToPage(currentPage + 1);
+  }, [currentPage, totalPages, jumpToPage]);
 
-  const handlePageInputSubmit = () => {
+  const handlePageInputSubmit = useCallback(() => {
     const num = Number(pageInput);
-    if (!Number.isNaN(num)) {
-      jumpToPage(num);
-    }
-  };
+    if (!Number.isNaN(num)) jumpToPage(num);
+  }, [pageInput, jumpToPage]);
 
-  const handleToggleHighlight = () => {
+  const handleToggleHighlight = useCallback(() => {
     setIsHighlightMode((prev) => {
       const next = !prev;
       if (next) {
@@ -1619,9 +2904,9 @@ export default function PdfViewerWithBookmarks() {
       }
       return next;
     });
-  };
+  }, []);
 
-  const handleToggleTextHighlight = () => {
+  const handleToggleTextHighlight = useCallback(() => {
     setIsTextHighlightMode((prev) => {
       const next = !prev;
       if (next) {
@@ -1630,9 +2915,9 @@ export default function PdfViewerWithBookmarks() {
       }
       return next;
     });
-  };
+  }, []);
 
-  const handleToggleErase = () => {
+  const handleToggleErase = useCallback(() => {
     setIsEraseMode((prev) => {
       const next = !prev;
       if (next) {
@@ -1641,45 +2926,40 @@ export default function PdfViewerWithBookmarks() {
       }
       return next;
     });
-  };
-
-  const handleSearchClick = () => {
-    handleSearch();
-  };
-
-  const handleGotoMatchIndex = (nextIndex) => {
-    gotoMatch(nextIndex);
-  };
+  }, []);
 
   // 탭 드래그
-  const handleTabDragStart = (e, tabId) => {
+  const handleTabDragStart = useCallback((e, tabId) => {
     setDraggingTabId(tabId);
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = "move";
       e.dataTransfer.setData("text/plain", tabId);
     }
-  };
+  }, []);
 
-  const handleTabDragOver = (e, targetTabId) => {
-    e.preventDefault();
-    if (!draggingTabId || draggingTabId === targetTabId) return;
+  const handleTabDragOver = useCallback(
+    (e, targetTabId) => {
+      e.preventDefault();
+      if (!draggingTabId || draggingTabId === targetTabId) return;
 
-    setTabs((prev) => {
-      const fromIndex = prev.findIndex((t) => t.id === draggingTabId);
-      const toIndex = prev.findIndex((t) => t.id === targetTabId);
-      if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex)
-        return prev;
+      setTabs((prev) => {
+        const fromIndex = prev.findIndex((t) => t.id === draggingTabId);
+        const toIndex = prev.findIndex((t) => t.id === targetTabId);
+        if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex)
+          return prev;
 
-      const next = [...prev];
-      const [moved] = next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, moved);
-      return next;
-    });
-  };
+        const next = [...prev];
+        const [moved] = next.splice(fromIndex, 1);
+        next.splice(toIndex, 0, moved);
+        return next;
+      });
+    },
+    [draggingTabId],
+  );
 
-  const handleTabDragEnd = () => {
+  const handleTabDragEnd = useCallback(() => {
     setDraggingTabId(null);
-  };
+  }, []);
 
   return (
     <Container
@@ -1704,6 +2984,7 @@ export default function PdfViewerWithBookmarks() {
         setThumbnailScale={setThumbnailScale}
         jumpToPage={jumpToPage}
         toggleBookmarkPage={toggleBookmarkPage}
+        onRequestThumbnail={requestThumbnail}
       />
 
       {/* 중앙 영역 */}
@@ -1736,8 +3017,6 @@ export default function PdfViewerWithBookmarks() {
 
         <Main
           ref={mainRef}
-          onScroll={handleScroll}
-          onWheel={handleWheel}
           $freeHighlight={isHighlightMode}
           $textHighlight={isTextHighlightMode}
           $erase={isEraseMode}
@@ -1766,8 +3045,8 @@ export default function PdfViewerWithBookmarks() {
             hasSearchResults={hasSearchResults}
             searchIndex={searchIndex}
             searchTotal={searchMatches.length}
-            onSearch={handleSearchClick}
-            onGotoMatch={handleGotoMatchIndex}
+            onSearch={handleSearch}
+            onGotoMatch={gotoMatch}
             // 줌
             scale={scale}
             onZoomIn={handleZoomIn}
@@ -1784,6 +3063,7 @@ export default function PdfViewerWithBookmarks() {
                     key={i}
                     data-page={pageNum}
                     $minHeight={estimatedPageHeight}
+                    $minWidth={estimatedPageWidth}
                     ref={(el) => {
                       if (el) pageContainerRefs.current[i] = el;
                     }}
@@ -1817,8 +3097,8 @@ export default function PdfViewerWithBookmarks() {
                         cursor: isEraseMode
                           ? `url(${eraserCursor}) 6 6, auto`
                           : isTextHighlightMode
-                          ? `url(${colorPenCursor}) 4 18, auto`
-                          : "default",
+                            ? `url(${colorPenCursor}) 4 18, auto`
+                            : "default",
                       }}
                       onMouseUp={handleTextLayerMouseUp(pageNum)}
                     />
