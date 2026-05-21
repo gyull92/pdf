@@ -3,8 +3,134 @@ const { app, BrowserWindow, ipcMain, Menu } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os"); // ✅ 사용자 홈 디렉터리용
+const crypto = require("crypto");
+
+// 🔹 PDFium 렌더 결과를 임시 파일로 받기 위한 디렉터리
+//    pdfium-native가 JS에 직접 반환하는 Buffer는 external buffer라서
+//    V8 IPC 직렬화가 거부함. 우회: 파일에 PNG를 쓰고 fs.readFile로 일반 Buffer를 얻는다.
+const PDFIUM_TMP_DIR = path.join(os.tmpdir(), "gyul-pdf-render");
+try {
+  fs.mkdirSync(PDFIUM_TMP_DIR, { recursive: true });
+  // 앱 시작 시 이전 세션의 잔여 파일 청소 (비동기로 처리)
+  fs.promises
+    .readdir(PDFIUM_TMP_DIR)
+    .then((files) =>
+      Promise.all(
+        files.map((f) =>
+          fs.promises.unlink(path.join(PDFIUM_TMP_DIR, f)).catch(() => {}),
+        ),
+      ),
+    )
+    .catch(() => {});
+} catch (_) {
+  /* ignore */
+}
 
 const isDev = !app.isPackaged;
+
+// 🔹 PDFium 네이티브 엔진 (ESM 패키지이므로 dynamic import 사용)
+//    렌더러는 IPC로만 호출하며, 무거운 PDF 작업은 모두 main 프로세스에서 수행됨
+//    (Edge/Chrome과 동일한 아키텍처)
+let pdfiumMod = null;
+let pdfiumError = null;
+const pdfiumReady = (async () => {
+  try {
+    pdfiumMod = await import("pdfium-native");
+    // 동시 작업 수 설정 — PDFium 내부는 mutex 직렬화이므로 너무 크게 늘려도 효과는 한계
+    try {
+      const cores = os.cpus()?.length || 4;
+      const target = Math.max(2, Math.min(8, Math.floor(cores * 0.75)));
+      pdfiumMod.concurrency(target);
+    } catch (_) {
+      /* ignore concurrency setup failure */
+    }
+  } catch (e) {
+    pdfiumError = e;
+    console.error("[pdfium-native] load failed:", e);
+  }
+})();
+
+// 문서 핸들 저장소: docId → { doc, pages, pageLru }
+const pdfDocs = new Map();
+let pdfDocIdSeq = 0;
+// 문서당 메인 프로세스에 유지할 PDFium 페이지 핸들 상한 (16GB RAM)
+const MAX_CACHED_PAGES_PER_DOC = 48;
+
+function touchPageLru(entry, pageIndex) {
+  if (!entry.pageLru) entry.pageLru = [];
+  const i = entry.pageLru.indexOf(pageIndex);
+  if (i >= 0) entry.pageLru.splice(i, 1);
+  entry.pageLru.push(pageIndex);
+}
+
+function evictPagesIfNeeded(entry) {
+  while (
+    entry.pages.size > MAX_CACHED_PAGES_PER_DOC &&
+    entry.pageLru &&
+    entry.pageLru.length > 0
+  ) {
+    const victim = entry.pageLru.shift();
+    const page = entry.pages.get(victim);
+    if (!page) continue;
+    try {
+      page.close?.();
+    } catch (_) {
+      /* ignore */
+    }
+    entry.pages.delete(victim);
+  }
+}
+
+async function ensurePdfium() {
+  await pdfiumReady;
+  if (!pdfiumMod) {
+    throw new Error(
+      "pdfium-native 로드 실패: " + (pdfiumError?.message || "unknown"),
+    );
+  }
+  return pdfiumMod;
+}
+
+// 문서가 이미 destroy된 뒤 도착한 IPC 요청용 (에러 로그 없이 조용히 무시)
+class DocGoneError extends Error {
+  constructor(docId) {
+    super(`docId ${docId} no longer exists`);
+    this.name = "DocGoneError";
+  }
+}
+
+async function getOrOpenPage(docId, pageIndex) {
+  const entry = pdfDocs.get(docId);
+  if (!entry) throw new DocGoneError(docId);
+  let page = entry.pages.get(pageIndex);
+  if (!page) {
+    page = await entry.doc.getPage(pageIndex);
+    entry.pages.set(pageIndex, page);
+    touchPageLru(entry, pageIndex);
+    evictPagesIfNeeded(entry);
+  } else {
+    touchPageLru(entry, pageIndex);
+  }
+  return page;
+}
+
+function destroyPdfDoc(docId) {
+  const entry = pdfDocs.get(docId);
+  if (!entry) return;
+  for (const page of entry.pages.values()) {
+    try {
+      page.close?.();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  try {
+    entry.doc.destroy?.();
+  } catch (_) {
+    /* ignore */
+  }
+  pdfDocs.delete(docId);
+}
 
 let mainWindow = null;
 // OS에서 넘겨준 "현재(또는 마지막) PDF 경로"를 보관
@@ -57,7 +183,7 @@ function createWindow() {
         : path.join(__dirname, "..", "assets", "mandarinPDF3.ico"), // 🧡 win용 아이콘
     autoHideMenuBar: true, // 창 메뉴바 자동 숨김
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: true, // renderer에서 require('electron') 사용 가능
       contextIsolation: false, // window.electronAPI 안 써도 됨
       // 🔹 창이 가려져 있거나 최소화되어도 렌더러의 timer/requestAnimationFrame이 정상 동작하도록
@@ -258,5 +384,166 @@ if (!gotLock) {
   ipcMain.on("save-folders", (event, folders) => {
     if (!Array.isArray(folders)) return;
     atomicWriteJson(getPersistentFoldersPath(), folders);
+  });
+
+  // ============================================================
+  // 🔹 PDFium IPC 핸들러
+  //    렌더러의 pdfEngine.js 어댑터에서 호출
+  //    모든 무거운 PDF 작업이 main 프로세스에서 수행됨
+  // ============================================================
+
+  const safeHandle = (channel, handler) => {
+    ipcMain.handle(channel, async (event, ...args) => {
+      try {
+        return await handler(event, ...args);
+      } catch (e) {
+        if (e instanceof DocGoneError) return null;
+        console.error(`[pdfium] ${channel}:`, e?.message || e);
+        throw new Error(`${channel}: ${e?.message || String(e)}`);
+      }
+    });
+  };
+
+  // 문서 열기 — 결과: { docId, pageCount, firstPage? }
+  //   path 문자열이면 디스크에서 직접 열기 (렌더러로 전체 파일 복사 생략)
+  safeHandle("pdfium:loadDocument", async (event, dataArg) => {
+    const pdfium = await ensurePdfium();
+    let doc;
+    if (typeof dataArg === "string") {
+      doc = await pdfium.loadDocument(dataArg);
+    } else {
+      let buf;
+      if (Buffer.isBuffer(dataArg)) {
+        buf = dataArg;
+      } else if (dataArg instanceof Uint8Array) {
+        buf = Buffer.from(dataArg.buffer, dataArg.byteOffset, dataArg.byteLength);
+      } else if (dataArg instanceof ArrayBuffer) {
+        buf = Buffer.from(dataArg);
+      } else {
+        buf = Buffer.from(dataArg);
+      }
+      doc = await pdfium.loadDocument(buf);
+    }
+    const docId = ++pdfDocIdSeq;
+    const pages = new Map();
+    pdfDocs.set(docId, { doc, pages, pageLru: [] });
+
+    let firstPage = null;
+    try {
+      const page = await doc.getPage(0);
+      pages.set(0, page);
+      firstPage = {
+        width: Number(page.width),
+        height: Number(page.height),
+        rotation: Number(page.rotation || 0),
+      };
+    } catch (_) {
+      /* ignore */
+    }
+
+    const pageCount = Number(doc.pageCount) | 0;
+    return { docId, pageCount, firstPage };
+  });
+
+  // 페이지 메타 조회 — 결과: { width, height, rotation, objectCount }
+  safeHandle("pdfium:getPageMeta", async (event, docId, pageIndex) => {
+    const page = await getOrOpenPage(docId, pageIndex);
+    if (!page) return null;
+    return {
+      width: Number(page.width),
+      height: Number(page.height),
+      rotation: Number(page.rotation || 0),
+      objectCount: Number(page.objectCount || 0),
+    };
+  });
+
+  // 페이지 렌더 — 임시 파일 경유 후 Uint8Array로 반환 (external buffer 회피)
+  //   options: { format?: 'jpeg'|'png', quality?: 1-100 }
+  safeHandle(
+    "pdfium:renderPage",
+    async (event, docId, pageIndex, scale, options = {}) => {
+      const page = await getOrOpenPage(docId, pageIndex);
+      if (!page) return null;
+      const format = options.format === "png" ? "png" : "jpeg";
+      const quality =
+        typeof options.quality === "number" ? options.quality : 85;
+      const ext = format === "png" ? "png" : "jpg";
+
+      const rand = crypto.randomBytes(6).toString("hex");
+      const outPath = path.join(
+        PDFIUM_TMP_DIR,
+        `r${docId}-${pageIndex}-${rand}.${ext}`,
+      );
+
+      try {
+        await page.render({
+          scale,
+          format,
+          quality,
+          output: outPath,
+        });
+      } catch (e) {
+        fs.promises.unlink(outPath).catch(() => {});
+        throw e;
+      }
+
+      let buf;
+      try {
+        buf = await fs.promises.readFile(outPath);
+      } finally {
+        fs.promises.unlink(outPath).catch(() => {});
+      }
+
+      // fs.readFile Buffer → 복사된 Uint8Array (IPC structured clone 안전, base64보다 훨씬 빠름)
+      return {
+        mime: format === "png" ? "image/png" : "image/jpeg",
+        data: new Uint8Array(buf),
+      };
+    },
+  );
+
+  // 페이지 텍스트 객체 추출 — 결과: 텍스트 객체 배열
+  //   [{ text, left, bottom, right, top, fontSize, fontName, fontFamily? }]
+  safeHandle("pdfium:getTextObjects", async (event, docId, pageIndex) => {
+    const page = await getOrOpenPage(docId, pageIndex);
+    if (!page) return [];
+    const out = [];
+    try {
+      for await (const obj of page.objects()) {
+        if (!obj || obj.type !== "text") continue;
+        const text = obj.text;
+        if (!text) continue;
+        const b = obj.bounds || { left: 0, bottom: 0, right: 0, top: 0 };
+        out.push({
+          text: String(text),
+          left: Number(b.left),
+          bottom: Number(b.bottom),
+          right: Number(b.right),
+          top: Number(b.top),
+          fontSize: Number(obj.fontSize || 0),
+          fontName: String(obj.fontName || "default"),
+          fontFamily: obj.fontFamily ? String(obj.fontFamily) : null,
+        });
+      }
+    } catch (e) {
+      console.warn("[pdfium] getTextObjects failed:", e);
+    }
+    return out;
+  });
+
+  // 문서 종료
+  safeHandle("pdfium:destroyDocument", async (event, docId) => {
+    destroyPdfDoc(docId);
+    return true;
+  });
+
+  // 진단/헬스체크용
+  safeHandle("pdfium:isAvailable", async () => {
+    try {
+      await ensurePdfium();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) };
+    }
   });
 }

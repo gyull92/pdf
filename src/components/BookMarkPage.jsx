@@ -1028,7 +1028,7 @@ function BookmarkSidebar({ bookmarks, setBookmarks, goToBookmark }) {
                   justifyContent: "space-between",
                 }}
               >
-                <h3 style={{ margin: 0 }}>📑 즐겨찾기</h3>
+                <h3 style={{ margin: 0, color: "#333" }}>📑 즐겨찾기</h3>
                 <button
                   type="button"
                   style={{
@@ -1268,7 +1268,7 @@ function BookmarkSidebar({ bookmarks, setBookmarks, goToBookmark }) {
                 paddingBottom: 8,
               }}
             >
-              <h4 style={{ margin: "0 0 4px", cursor: "default" }}>
+              <h4 style={{ margin: "0 0 4px", cursor: "default", color: "#333" }}>
                 📌 폴더 없음
               </h4>
 

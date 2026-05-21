@@ -295,7 +295,7 @@ function PageSidebar({
               gap: 4,
             }}
           >
-            <h3 style={{ margin: 0 }}>페이지</h3>
+            <h3 style={{ margin: 0, color: "#333" }}>페이지</h3>
 
             {/* 즐겨찾기 토글 버튼 */}
             <button

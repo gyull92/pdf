@@ -4,13 +4,16 @@
 // - 한도 초과 시 가장 오래 쓰지 않은 페이지부터 삭제(LRU)
 
 const DB_NAME = "gyul-pdf-cache";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_RENDERS = "renders";
 const STORE_DOC_META = "docMeta";
 const STORE_THUMBS = "thumbs";
+// 썸네일 해상도 변경 시 키 버전을 올려 기존 저해상도 캐시 무효화
+const THUMB_CACHE_KEY_VERSION = 2;
 
-// 캐시 한도 (대략). 사용자의 디스크 상황에 맞게 조정.
-const MAX_CACHE_BYTES = 800 * 1024 * 1024; // 800MB
+// 16GB RAM 환경: 디스크 캐시도 과도하면 getRender/getThumbs 시 RAM 급증
+export const MAX_RENDER_CACHE_BYTES = 400 * 1024 * 1024;
+export const MAX_THUMB_CACHE_BYTES = 120 * 1024 * 1024;
 
 let dbPromise = null;
 
@@ -32,10 +35,15 @@ function openDb() {
       if (!db.objectStoreNames.contains(STORE_DOC_META)) {
         db.createObjectStore(STORE_DOC_META);
       }
-      // v2: 썸네일 전용 저장소
       if (!db.objectStoreNames.contains(STORE_THUMBS)) {
         const tStore = db.createObjectStore(STORE_THUMBS);
         tStore.createIndex("docKey", "docKey", { unique: false });
+        tStore.createIndex("lastAccess", "lastAccess", { unique: false });
+      } else {
+        const tStore = event.target.transaction.objectStore(STORE_THUMBS);
+        if (!tStore.indexNames.contains("lastAccess")) {
+          tStore.createIndex("lastAccess", "lastAccess", { unique: false });
+        }
       }
       void event;
     };
@@ -69,34 +77,54 @@ function reqAsPromise(request) {
   });
 }
 
-// 캐시 사용량 추정 (장기 누적되면 정리)
-let approxBytes = -1;
-async function getApproxBytes() {
-  if (approxBytes >= 0) return approxBytes;
-  try {
-    const { store } = await tx(STORE_RENDERS, "readonly");
-    let total = 0;
-    await new Promise((resolve, reject) => {
-      const req = store.openCursor();
-      req.onsuccess = (e) => {
-        const cur = e.target.result;
-        if (!cur) {
-          resolve();
-          return;
-        }
-        total += cur.value?.size || 0;
-        cur.continue();
-      };
-      req.onerror = () => reject(req.error);
-    });
-    approxBytes = total;
-  } catch (_) {
-    approxBytes = 0;
-  }
-  return approxBytes;
+let approxRenderBytes = -1;
+let approxThumbBytes = -1;
+
+async function sumStoreBytes(storeName, sizeField = "size") {
+  const { store } = await tx(storeName, "readonly");
+  let total = 0;
+  await new Promise((resolve, reject) => {
+    const req = store.openCursor();
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur) {
+        resolve();
+        return;
+      }
+      const v = cur.value;
+      if (sizeField === "size") {
+        total += v?.size || 0;
+      } else {
+        total += v?.dataUrl?.length || 0;
+      }
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+  return total;
 }
 
-async function evictLRU(targetBytes) {
+async function getApproxRenderBytes() {
+  if (approxRenderBytes >= 0) return approxRenderBytes;
+  try {
+    approxRenderBytes = await sumStoreBytes(STORE_RENDERS, "size");
+  } catch (_) {
+    approxRenderBytes = 0;
+  }
+  return approxRenderBytes;
+}
+
+async function getApproxThumbBytes() {
+  if (approxThumbBytes >= 0) return approxThumbBytes;
+  try {
+    approxThumbBytes = await sumStoreBytes(STORE_THUMBS, "dataUrl");
+  } catch (_) {
+    approxThumbBytes = 0;
+  }
+  return approxThumbBytes;
+}
+
+async function evictRenderLRU(targetBytes) {
   try {
     const { store, complete } = await tx(STORE_RENDERS, "readwrite");
     const idx = store.index("lastAccess");
@@ -120,10 +148,61 @@ async function evictLRU(targetBytes) {
       req.onerror = () => reject(req.error);
     });
     await complete;
-    approxBytes = Math.max(0, approxBytes - freed);
+    if (approxRenderBytes >= 0) approxRenderBytes = Math.max(0, approxRenderBytes - freed);
   } catch (e) {
-    console.warn("캐시 evict 실패:", e);
+    console.warn("렌더 캐시 evict 실패:", e);
   }
+}
+
+async function evictThumbLRU(targetBytes) {
+  try {
+    const { store, complete } = await tx(STORE_THUMBS, "readwrite");
+    let idx = store.index("lastAccess");
+    if (!idx) idx = store;
+    let freed = 0;
+    await new Promise((resolve, reject) => {
+      const req = idx.openCursor ? idx.openCursor() : store.openCursor();
+      req.onsuccess = (e) => {
+        const cur = e.target.result;
+        if (!cur) {
+          resolve();
+          return;
+        }
+        if (freed >= targetBytes) {
+          resolve();
+          return;
+        }
+        freed += cur.value?.dataUrl?.length || 0;
+        cur.delete();
+        cur.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+    await complete;
+    if (approxThumbBytes >= 0) approxThumbBytes = Math.max(0, approxThumbBytes - freed);
+  } catch (e) {
+    console.warn("썸네일 캐시 evict 실패:", e);
+  }
+}
+
+async function deleteByDocKeyIndex(storeName, docKey) {
+  const { store, complete } = await tx(storeName, "readwrite");
+  const idx = store.index("docKey");
+  const range = IDBKeyRange.only(docKey);
+  await new Promise((resolve, reject) => {
+    const req = idx.openCursor(range);
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur) {
+        resolve();
+        return;
+      }
+      cur.delete();
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+  await complete;
 }
 
 export const pdfCache = {
@@ -132,15 +211,14 @@ export const pdfCache = {
       const { store } = await tx(STORE_RENDERS, "readonly");
       const value = await reqAsPromise(store.get(key));
       if (!value) return null;
-      // lastAccess 갱신은 별도 트랜잭션
-      this._touchAsync(key).catch(() => {});
+      this._touchRenderAsync(key).catch(() => {});
       return value;
     } catch (_) {
       return null;
     }
   },
 
-  async _touchAsync(key) {
+  async _touchRenderAsync(key) {
     try {
       const { store, complete } = await tx(STORE_RENDERS, "readwrite");
       const value = await reqAsPromise(store.get(key));
@@ -158,49 +236,42 @@ export const pdfCache = {
     try {
       const size =
         (payload?.imageBlob?.size || 0) +
-        (payload?.textLayer?.length || 0) * 32; // 대략 추정
+        (payload?.textLayer?.length || 0) * 32;
       const value = {
         ...payload,
         size,
         lastAccess: Date.now(),
       };
 
-      // 용량 한도 체크
-      const current = await getApproxBytes();
-      if (current + size > MAX_CACHE_BYTES) {
-        await evictLRU(Math.min(MAX_CACHE_BYTES / 4, size * 4));
+      let current = await getApproxRenderBytes();
+      while (current + size > MAX_RENDER_CACHE_BYTES) {
+        await evictRenderLRU(Math.max(MAX_RENDER_CACHE_BYTES / 8, size * 2));
+        approxRenderBytes = -1;
+        current = await getApproxRenderBytes();
+        if (current === 0) break;
       }
 
       const { store, complete } = await tx(STORE_RENDERS, "readwrite");
       store.put(value, key);
       await complete;
-      if (approxBytes >= 0) approxBytes += size;
+      if (approxRenderBytes >= 0) approxRenderBytes += size;
+      else approxRenderBytes = -1;
     } catch (e) {
-      // QuotaExceededError 등은 조용히 무시
       console.warn("렌더 캐시 저장 실패:", e);
     }
   },
 
   async clearByDocKey(docKey) {
+    await this.clearDocCache(docKey);
+  },
+
+  async clearDocCache(docKey) {
+    if (!docKey) return;
     try {
-      const { store, complete } = await tx(STORE_RENDERS, "readwrite");
-      const idx = store.index("docKey");
-      const range = IDBKeyRange.only(docKey);
-      await new Promise((resolve, reject) => {
-        const req = idx.openCursor(range);
-        req.onsuccess = (e) => {
-          const cur = e.target.result;
-          if (!cur) {
-            resolve();
-            return;
-          }
-          cur.delete();
-          cur.continue();
-        };
-        req.onerror = () => reject(req.error);
-      });
-      await complete;
-      approxBytes = -1; // 다시 측정
+      await deleteByDocKeyIndex(STORE_RENDERS, docKey);
+      await deleteByDocKeyIndex(STORE_THUMBS, docKey);
+      approxRenderBytes = -1;
+      approxThumbBytes = -1;
     } catch (e) {
       console.warn("문서별 캐시 삭제 실패:", e);
     }
@@ -225,15 +296,53 @@ export const pdfCache = {
     }
   },
 
-  // 🔹 썸네일 - 작은 dataURL을 docKey별로 보관
+  thumbCacheKey(docKey, pageNum) {
+    return `${docKey}|v=${THUMB_CACHE_KEY_VERSION}|p=${pageNum}`;
+  },
+
   async getThumb(docKey, pageNum) {
     try {
       const { store } = await tx(STORE_THUMBS, "readonly");
-      const value = await reqAsPromise(store.get(`${docKey}|p=${pageNum}`));
+      const value = await reqAsPromise(
+        store.get(this.thumbCacheKey(docKey, pageNum)),
+      );
+      if (value?.dataUrl) {
+        this._touchThumbAsync(docKey, pageNum).catch(() => {});
+      }
       return value?.dataUrl || null;
     } catch (_) {
       return null;
     }
+  },
+
+  async _touchThumbAsync(docKey, pageNum) {
+    try {
+      const key = this.thumbCacheKey(docKey, pageNum);
+      const { store, complete } = await tx(STORE_THUMBS, "readwrite");
+      const value = await reqAsPromise(store.get(key));
+      if (value) {
+        value.lastAccess = Date.now();
+        store.put(value, key);
+      }
+      await complete;
+    } catch (_) {
+      /* ignore */
+    }
+  },
+
+  /** 현재 페이지 주변만 IDB에서 읽어 RAM 부담 완화 */
+  async getThumbsInRange(docKey, lo, hi) {
+    const result = new Map();
+    const tasks = [];
+    for (let p = lo; p <= hi; p++) {
+      tasks.push(
+        this.getThumb(docKey, p).then((url) => {
+          if (url) result.set(p, url);
+        }),
+      );
+    }
+    await Promise.all(tasks);
+    return result;
   },
 
   async getThumbsForDoc(docKey, totalPages) {
@@ -248,6 +357,14 @@ export const pdfCache = {
           const cur = e.target.result;
           if (!cur) {
             resolve();
+            return;
+          }
+          const pk = cur.primaryKey;
+          if (
+            typeof pk === "string" &&
+            !pk.includes(`|v=${THUMB_CACHE_KEY_VERSION}|`)
+          ) {
+            cur.continue();
             return;
           }
           const v = cur.value;
@@ -268,12 +385,23 @@ export const pdfCache = {
 
   async setThumb(docKey, pageNum, dataUrl) {
     try {
+      const size = dataUrl?.length || 0;
+      let current = await getApproxThumbBytes();
+      while (current + size > MAX_THUMB_CACHE_BYTES) {
+        await evictThumbLRU(Math.max(MAX_THUMB_CACHE_BYTES / 6, size * 2));
+        approxThumbBytes = -1;
+        current = await getApproxThumbBytes();
+        if (current === 0) break;
+      }
+
       const { store, complete } = await tx(STORE_THUMBS, "readwrite");
       store.put(
-        { docKey, pageNum, dataUrl, lastAccess: Date.now() },
-        `${docKey}|p=${pageNum}`,
+        { docKey, pageNum, dataUrl, size, lastAccess: Date.now() },
+        this.thumbCacheKey(docKey, pageNum),
       );
       await complete;
+      if (approxThumbBytes >= 0) approxThumbBytes += size;
+      else approxThumbBytes = -1;
     } catch (e) {
       console.warn("썸네일 캐시 저장 실패:", e);
     }
@@ -299,23 +427,19 @@ export const pdfCache = {
       );
       s3.clear();
       await c3;
-      approxBytes = 0;
+      approxRenderBytes = 0;
+      approxThumbBytes = 0;
     } catch (e) {
       console.warn("캐시 전체 삭제 실패:", e);
     }
   },
 };
 
-// 문서를 식별하는 키
-//   - filePath가 있으면 그것을 사용 (윈도우/맥 절대경로)
-//   - 없으면 파일명으로 fallback
-//   - byteLength가 있으면 같은 경로의 다른 사이즈 파일을 구분
 export function makeDocKey({ filePath, fileName, byteLength }) {
   const base = filePath || fileName || "unknown";
   return byteLength ? `${base}|len=${byteLength}` : base;
 }
 
-// 페이지별 렌더 키
 export function makeRenderKey(docKey, pageNum, scale, dpr) {
   return `${docKey}|p=${pageNum}|s=${scale.toFixed(3)}|d=${dpr.toFixed(2)}`;
 }
