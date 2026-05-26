@@ -582,31 +582,31 @@ if (!gotLock) {
         .then(({ response }) => {
           if (response === 0) {
             autoUpdater.downloadUpdate();
-            if (mainWindow) {
-              mainWindow.webContents.send("update-downloading", true);
-            }
           }
         });
     });
 
     autoUpdater.on("update-not-available", () => {
-      // 최신 버전 — 아무것도 안 함
+      // 최신 버전 — 알림 없음
     });
 
     autoUpdater.on("download-progress", (progress) => {
+      const percent = Math.round(progress.percent);
       if (mainWindow) {
-        mainWindow.setProgressBar(progress.percent / 100);
+        mainWindow.setProgressBar(percent / 100);
+        mainWindow.setTitle(`업데이트 다운로드 중... ${percent}%`);
       }
     });
 
     autoUpdater.on("update-downloaded", () => {
       if (mainWindow) {
         mainWindow.setProgressBar(-1);
+        mainWindow.setTitle("귤PDF뷰어");
       }
       dialog
         .showMessageBox(mainWindow, {
           type: "info",
-          title: "업데이트 준비 완료",
+          title: "업데이트 완료",
           message:
             "업데이트가 다운로드되었습니다.\n지금 재시작하여 설치할까요?",
           buttons: ["지금 재시작", "나중에"],
@@ -621,14 +621,16 @@ if (!gotLock) {
     });
 
     autoUpdater.on("error", (err) => {
+      if (mainWindow) {
+        mainWindow.setProgressBar(-1);
+        mainWindow.setTitle("귤PDF뷰어");
+      }
       console.error("자동 업데이트 오류:", err?.message || err);
     });
 
-    // 앱 시작 5초 후 업데이트 확인 (시작 성능에 영향 주지 않도록)
-    setTimeout(() => {
-      autoUpdater.checkForUpdates().catch((err) => {
-        console.warn("업데이트 확인 실패:", err?.message || err);
-      });
-    }, 5000);
+    // 앱 시작 즉시 업데이트 확인
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.warn("업데이트 확인 실패:", err?.message || err);
+    });
   }
 }
