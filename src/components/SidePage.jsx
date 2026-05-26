@@ -21,6 +21,8 @@ const Sidebar = styled.div`
   box-sizing: border-box;
   overflow-y: auto;
   overflow-x: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   flex-shrink: 0;
   background: #fff;
 `;
@@ -174,15 +176,16 @@ function PageSidebar({
     return pages.filter((p) => bookmarkedPageSet.has(p));
   }, [totalPages, showOnlyBookmarked, fileName, bookmarkedPageSet]);
 
-  // 현재 페이지로 썸네일 자동 스크롤
+  // 현재 페이지로 썸네일 자동 스크롤 (짧은 디바운스로 페이지 번호 흔들림 완화)
   useLayoutEffect(() => {
     const container = sidebarRef.current;
     if (!container) return;
 
-    const thumb = thumbnailRefs.current[currentPage - 1];
-    if (!thumb) return;
+    const page = currentPage;
+    const timer = setTimeout(() => {
+      const thumb = thumbnailRefs.current[page - 1];
+      if (!thumb) return;
 
-    const rafId = requestAnimationFrame(() => {
       const containerRect = container.getBoundingClientRect();
       const thumbRect = thumb.getBoundingClientRect();
 
@@ -199,9 +202,9 @@ function PageSidebar({
         top: targetScrollTop,
         behavior: "auto",
       });
-    });
+    }, 48);
 
-    return () => cancelAnimationFrame(rafId);
+    return () => clearTimeout(timer);
   }, [currentPage, thumbnailPages.length, thumbnailScale]);
 
   // visiblePages 또는 thumbnails 변화에 따라, 보이는데 아직 비어 있는 페이지는 즉시 요청

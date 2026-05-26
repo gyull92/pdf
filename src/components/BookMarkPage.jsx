@@ -47,6 +47,8 @@ const RightSidebar = styled.div`
   border-left: 1px solid #ccc;
   padding: 10px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   flex-shrink: 0;
   background: #fff;
 `;

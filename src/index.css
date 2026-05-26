@@ -24,6 +24,12 @@
   color: transparent;
 }
 
+/* 검색 일치 — 글자가 보이도록 (textLayer 기본 transparent 덮어씀) */
+.textLayer [data-search-hit] {
+  color: #ffffff !important;
+  background-color: rgba(10, 59, 255, 0.85) !important;
+}
+
 /* 앱 전체 레이아웃 — Vite 기본 템플릿 스타일 제거 (body flex center 등이 UI를 깨뜨림) */
 html,
 body,
@@ -33,6 +39,11 @@ body,
   width: 100%;
   height: 100%;
   overflow: hidden;
+}
+
+/* Chromium/Electron 네이티브 스크롤·합성 경로 활용 */
+html {
+  scroll-behavior: auto;
 }
 
 body {

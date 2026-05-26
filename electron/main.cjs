@@ -1,9 +1,10 @@
 // main.cjs
-const { app, BrowserWindow, ipcMain, Menu } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
-const os = require("os"); // ✅ 사용자 홈 디렉터리용
+const os = require("os");
 const crypto = require("crypto");
+const { autoUpdater } = require("electron-updater");
 
 // 🔹 PDFium 렌더 결과를 임시 파일로 받기 위한 디렉터리
 //    pdfium-native가 JS에 직접 반환하는 Buffer는 external buffer라서
@@ -27,6 +28,14 @@ try {
 }
 
 const isDev = !app.isPackaged;
+
+// Windows: 창 가림(occlusion) 계산이 스크롤 프레임을 끊기는 경우가 있어 비활성화
+if (process.platform === "win32") {
+  app.commandLine.appendSwitch(
+    "disable-features",
+    "CalculateNativeWinOcclusion",
+  );
+}
 
 // 🔹 PDFium 네이티브 엔진 (ESM 패키지이므로 dynamic import 사용)
 //    렌더러는 IPC로만 호출하며, 무거운 PDF 작업은 모두 main 프로세스에서 수행됨
@@ -273,6 +282,11 @@ if (!gotLock) {
         createWindow();
       }
     });
+
+    // 🔹 자동 업데이트: 배포 빌드에서만 동작
+    if (!isDev) {
+      initAutoUpdater();
+    }
   });
 
   app.on("window-all-closed", () => {
@@ -546,4 +560,75 @@ if (!gotLock) {
       return { ok: false, error: e?.message || String(e) };
     }
   });
+
+  // ============================================================
+  // 🔹 자동 업데이트 (electron-updater)
+  // ============================================================
+  function initAutoUpdater() {
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
+
+    autoUpdater.on("update-available", (info) => {
+      const version = info.version || "새 버전";
+      dialog
+        .showMessageBox(mainWindow, {
+          type: "info",
+          title: "업데이트 알림",
+          message: `새 버전(v${version})이 있습니다.\n지금 업데이트할까요?`,
+          buttons: ["업데이트", "나중에"],
+          defaultId: 0,
+          cancelId: 1,
+        })
+        .then(({ response }) => {
+          if (response === 0) {
+            autoUpdater.downloadUpdate();
+            if (mainWindow) {
+              mainWindow.webContents.send("update-downloading", true);
+            }
+          }
+        });
+    });
+
+    autoUpdater.on("update-not-available", () => {
+      // 최신 버전 — 아무것도 안 함
+    });
+
+    autoUpdater.on("download-progress", (progress) => {
+      if (mainWindow) {
+        mainWindow.setProgressBar(progress.percent / 100);
+      }
+    });
+
+    autoUpdater.on("update-downloaded", () => {
+      if (mainWindow) {
+        mainWindow.setProgressBar(-1);
+      }
+      dialog
+        .showMessageBox(mainWindow, {
+          type: "info",
+          title: "업데이트 준비 완료",
+          message:
+            "업데이트가 다운로드되었습니다.\n지금 재시작하여 설치할까요?",
+          buttons: ["지금 재시작", "나중에"],
+          defaultId: 0,
+          cancelId: 1,
+        })
+        .then(({ response }) => {
+          if (response === 0) {
+            autoUpdater.quitAndInstall();
+          }
+        });
+    });
+
+    autoUpdater.on("error", (err) => {
+      console.error("자동 업데이트 오류:", err?.message || err);
+    });
+
+    // 앱 시작 5초 후 업데이트 확인 (시작 성능에 영향 주지 않도록)
+    setTimeout(() => {
+      autoUpdater.checkForUpdates().catch((err) => {
+        console.warn("업데이트 확인 실패:", err?.message || err);
+      });
+    }, 5000);
+  }
 }

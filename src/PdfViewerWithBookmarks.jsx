@@ -6,6 +6,7 @@ import {
   useCallback,
   useMemo,
 } from "react";
+import { flushSync } from "react-dom";
 import styled from "styled-components";
 // 🔹 네이티브 PDFium 엔진 어댑터 (PDF.js 호환 API)
 import {
@@ -93,6 +94,8 @@ const TabBar = styled.div`
   border-bottom: 1px solid #ddd;
   flex-shrink: 0;
   overflow-x: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 `;
 
 // 개별 탭
@@ -143,6 +146,9 @@ const Main = styled.div`
   display: flex;
   flex-direction: column;
   overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-gutter: stable;
   position: relative;
 
   cursor: ${(props) => {
@@ -233,7 +239,10 @@ const PAGE_MARGIN_BOTTOM = 20;
 // DOM에 실제로 마운트할 페이지 범위 (현재 위치 ±)
 const MOUNT_BUFFER = Math.max(WINDOW_SIZE + 4, KEEP_RENDERED_RANGE + 4);
 const MAX_DPR = 1.5;
-const SCROLL_SETTLE_MS = 80;
+const SCROLL_SETTLE_MS = 120;
+// scrollend: 일부 Electron/Chromium 빌드에서 발화가 불안정하므로 항상 타이머 폴백 병용
+const SUPPORTS_SCROLL_END =
+  typeof window !== "undefined" && "onscrollend" in window;
 
 const HARDWARE_CONCURRENCY =
   typeof navigator !== "undefined" && navigator.hardwareConcurrency
@@ -246,8 +255,8 @@ const BODY_RENDER_CONCURRENCY = Math.max(
   Math.min(8, Math.floor(HARDWARE_CONCURRENCY * 0.75)),
 );
 const THUMB_RENDER_CONCURRENCY = Math.max(
-  1,
-  Math.min(3, Math.floor(HARDWARE_CONCURRENCY / 4)),
+  2,
+  Math.min(6, Math.floor(HARDWARE_CONCURRENCY / 2)),
 );
 
 // 사이드바 표시 폭(~165px) × DPR(최대 2) — 이전 80px 대비 선명도 개선
@@ -263,7 +272,7 @@ const getThumbPixelWidth = () =>
 
 // 16GB RAM: 동시에 PDFium 문서를 열어둘 탭 수·RAM 썸네일·프리렌더 상한
 const MAX_OPEN_PDF_DOCS = 2;
-const THUMB_RAM_RADIUS = 48;
+const THUMB_RAM_RADIUS = 100;
 const MAX_PAGE_TEXT_CACHE_ENTRIES = 40;
 const MAX_PRERENDER_PAGES = 36;
 const PRERENDER_PAGE_RADIUS = 28;
@@ -409,7 +418,6 @@ export default function PdfViewerWithBookmarks() {
   // 🔹 스크롤 중인지 추적 (스크롤 중에는 무거운 PDF.js 렌더링을 보류해 jank 방지)
   const isScrollingRef = useRef(false);
   const scrollSettleTimerRef = useRef(null);
-  const scrollRenderKickRef = useRef(null);
   // 페이지별 렌더 품질: 'preview' | 'full'
   const pageQualityRef = useRef(new Map());
   // 점프·현재 페이지 full 렌더 중에는 일반 백그라운드 워커 일시 정지
@@ -658,7 +666,10 @@ export default function PdfViewerWithBookmarks() {
         }
         const mark = document.createElement("span");
         mark.textContent = fullText.slice(index, index + q.length);
-        mark.style.backgroundColor = "rgba(10, 59, 255, 0.8)";
+        mark.dataset.searchHit = "true";
+        mark.dataset.searchStart = String(index);
+        mark.style.backgroundColor = "rgba(10, 59, 255, 0.85)";
+        mark.style.color = "#ffffff";
         frag.appendChild(mark);
         lastIndex = index + q.length;
         index = lowerText.indexOf(lowerQ, lastIndex);
@@ -727,6 +738,52 @@ export default function PdfViewerWithBookmarks() {
       );
     },
     [getPageStride, totalPages, scale],
+  );
+
+  // 뷰포트 세로 중앙이 겹치는 페이지 (DOM 기준 — 썸네일·툴바 동기화용)
+  const pageFromViewportCenter = useCallback(() => {
+    const container = mainRef.current;
+    if (!container || !totalPages) return currentPageRef.current || 1;
+
+    const centerY =
+      container.getBoundingClientRect().top + container.clientHeight / 2;
+
+    const { lo, hi } = mountRangeRef.current;
+    for (let p = lo; p <= hi; p++) {
+      const el = pageContainerRefs.current[p - 1];
+      if (!el) continue;
+      const rect = el.getBoundingClientRect();
+      if (centerY >= rect.top && centerY <= rect.bottom) return p;
+    }
+
+    let bestPage = currentPageRef.current || 1;
+    let bestDist = Infinity;
+    for (let p = lo; p <= hi; p++) {
+      const el = pageContainerRefs.current[p - 1];
+      if (!el) continue;
+      const rect = el.getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      const dist = Math.abs(mid - centerY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPage = p;
+      }
+    }
+    return bestPage;
+  }, [totalPages]);
+
+  // 스크롤 중: ref만 갱신 (React 리렌더 없음, 성능 보호)
+  // 스크롤 종료 후: state도 갱신 (썸네일·툴바 동기화)
+  const syncCurrentPageFromViewport = useCallback(
+    (flush = false) => {
+      const next = pageFromViewportCenter();
+      if (next === currentPageRef.current) return;
+      currentPageRef.current = next;
+      if (flush || !isScrollingRef.current) {
+        setCurrentPage(next);
+      }
+    },
+    [pageFromViewportCenter],
   );
 
   const ensureMountRange = useCallback(
@@ -818,6 +875,54 @@ export default function PdfViewerWithBookmarks() {
     if (pageQualityRef.current.get(p) === "full") return;
     await renderPage(p, scale, { tier: "full" });
   }, [pdf, scale]);
+
+  // 스크롤 종료 시 가상 마운트 범위를 현재 위치에 맞게 축소
+  const tightenMountRange = useCallback(() => {
+    if (!pdf || !totalPages) return;
+    const container = mainRef.current;
+    if (!container) return;
+    const center = pageFromScrollTop(container.scrollTop);
+    const lo = Math.max(1, center - MOUNT_BUFFER);
+    const hi = Math.min(totalPages, center + MOUNT_BUFFER);
+    const prev = mountRangeRef.current;
+    if (prev.lo === lo && prev.hi === hi) return;
+    mountRangeRef.current = { lo, hi };
+    setMountRange({ lo, hi });
+  }, [pdf, totalPages, pageFromScrollTop]);
+
+  // 점프·북마크 등 프로그램matic 이동 후 렌더 재개 (휠 스크롤 없이도 본문 표시)
+  const endProgrammaticNavigation = useCallback(() => {
+    jumpScrollLockRef.current = false;
+    isScrollingRef.current = false;
+    backgroundRenderPausedRef.current = false;
+    if (scrollSettleTimerRef.current) {
+      clearTimeout(scrollSettleTimerRef.current);
+      scrollSettleTimerRef.current = null;
+    }
+    if (pdf && totalPages) {
+      void ensureCurrentPageFull();
+    }
+    setVisiblePagesVersion((v) => v + 1);
+  }, [pdf, totalPages, ensureCurrentPageFull]);
+
+  // 스크롤이 끝났을 때 렌더·상태 동기화 (브라우저 scrollend + 폴백 타이머)
+  const finishScrolling = useCallback(() => {
+    if (!isScrollingRef.current) return;
+    isScrollingRef.current = false;
+    backgroundRenderPausedRef.current = false;
+
+    if (pdf && totalPages) syncCurrentPageFromViewport(true);
+
+    tightenMountRange();
+    void ensureCurrentPageFull();
+    setVisiblePagesVersion((v) => v + 1);
+  }, [
+    pdf,
+    totalPages,
+    syncCurrentPageFromViewport,
+    tightenMountRange,
+    ensureCurrentPageFull,
+  ]);
 
   const cancelAllPageRenderTasks = () => {
     pageRenderTasksRef.current.forEach((task) => {
@@ -1040,23 +1145,25 @@ export default function PdfViewerWithBookmarks() {
     return true;
   };
 
-  // 멀리 점프 직후: 캐시/썸네일로 회색 화면을 즉시 채움
-  const paintJumpPlaceholder = async (num, scaleValue = scale) => {
+  // 점프 직후: RAM 썸네일만 동기 시도 (느린 IPC 썸네일 생성은 백그라운드)
+  const tryFastJumpFill = (num, scaleValue = scale) => {
     if (!num || renderedPagesRef.current.has(num)) return true;
-    if (drawPreviewFromThumb(num)) return true;
+    return drawPreviewFromThumb(num);
+  };
 
+  const fillJumpPlaceholderBackground = async (num, scaleValue = scale) => {
+    if (!num || renderedPagesRef.current.has(num)) return;
     const docKey = docKeyRef.current;
     if (docKey) {
       try {
-        const [cachedThumb, outputScale] = await Promise.all([
+        const outputScale = getOutputScale();
+        const [cachedThumb, cached] = await Promise.all([
           pdfCache.getThumb(docKey, num),
-          Promise.resolve(getOutputScale()),
+          pdfCache.getRender(makeRenderKey(docKey, num, scaleValue, outputScale)),
         ]);
         if (cachedThumb && drawImageOnPageCanvas(num, cachedThumb, scaleValue)) {
-          return true;
+          return;
         }
-        const renderKey = makeRenderKey(docKey, num, scaleValue, outputScale);
-        const cached = await pdfCache.getRender(renderKey);
         if (
           cached &&
           (await applyCachedRenderToPage(
@@ -1066,25 +1173,36 @@ export default function PdfViewerWithBookmarks() {
             renderGenerationRef.current,
           ))
         ) {
-          return true;
+          return;
         }
       } catch (_) {
         /* ignore */
       }
     }
-
     try {
       const dataUrl = await renderThumbnailForPage(num);
       if (dataUrl) {
         writeThumbnail(num, dataUrl);
         drawImageOnPageCanvas(num, dataUrl, scaleValue);
-        return true;
       }
     } catch (_) {
       /* ignore */
     }
-    return false;
   };
+
+  const waitForPageCanvas = useCallback(async (pageNum, maxMs = 1200) => {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+      if (
+        canvasRefs.current[pageNum - 1] &&
+        textLayerRefs.current[pageNum - 1]
+      ) {
+        return true;
+      }
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+    return false;
+  }, []);
 
   const resetRenderState = () => {
     renderedPagesRef.current = new Set();
@@ -1256,15 +1374,11 @@ export default function PdfViewerWithBookmarks() {
     if (!bodyFirstReadyRef.current) return;
     thumbWorkerActiveRef.current = true;
 
-    // 포어그라운드에서는 UI에 양보 (requestIdleCallback),
-    // 백그라운드(hidden)에서는 throttle 회피를 위해 즉시 다음 단계 (setTimeout)
     const yieldNext = (cb) => {
       if (typeof document !== "undefined" && document.hidden) {
         setTimeout(cb, 0);
-      } else if (typeof window.requestIdleCallback === "function") {
-        window.requestIdleCallback(cb, { timeout: 200 });
       } else {
-        setTimeout(cb, 0);
+        setTimeout(cb, 4);
       }
     };
 
@@ -1283,10 +1397,11 @@ export default function PdfViewerWithBookmarks() {
           continue;
         return p;
       }
-      // 큐가 비면 현재 페이지 주변만 생성 (전체 문서 스캔 방지)
+      // 큐가 비면 현재 페이지 주변 ± 30만 탐색 (전체 문서 스캔 방지)
       const total = totalPages || 0;
       const cp = currentPageRef.current || 1;
-      for (let d = 0; d <= total; d++) {
+      const maxSearch = Math.min(30, total);
+      for (let d = 0; d <= maxSearch; d++) {
         for (const p of [cp - d, cp + d]) {
           if (
             p >= 1 &&
@@ -1506,8 +1621,8 @@ export default function PdfViewerWithBookmarks() {
     const outputScale = getOutputScale();
     const docKey = docKeyRef.current;
 
-    // 1) 캐시 hit — full 렌더(또는 점프 placeholder) 시 즉시 표시
-    if (docKey && !isPreview) {
+    // 1) 캐시 hit — 점프/프리뷰·full 모두 즉시 표시
+    if (docKey) {
       const renderKey = makeRenderKey(docKey, num, scaleValue, outputScale);
       try {
         const cached = await pdfCache.getRender(renderKey);
@@ -1658,41 +1773,182 @@ export default function PdfViewerWithBookmarks() {
   // 스크롤 위치에 따라 마운트 범위 이동 (멀리 점프 시에는 jumpToPage가 직접 설정)
   const jumpScrollLockRef = useRef(false);
   const jumpInProgressRef = useRef(false);
-  const pendingJumpScrollTopRef = useRef(null);
+  const pendingJumpPageRef = useRef(null);
+  const bootstrapViewerAtPageRef = useRef(async () => {});
+
+  const flushMountRangeForPage = useCallback(
+    (pageNum) => {
+      if (!totalPages) return;
+      const lo = Math.max(1, pageNum - MOUNT_BUFFER);
+      const hi = Math.min(totalPages, pageNum + MOUNT_BUFFER);
+      mountRangeRef.current = { lo, hi };
+      pendingJumpPageRef.current = null;
+      flushSync(() => {
+        setMountRange({ lo, hi });
+        setCurrentPage(pageNum);
+        setPageInput(String(pageNum));
+      });
+    },
+    [totalPages],
+  );
+
+  const computeScrollTopForPage = useCallback(
+    (pageNum) => {
+      const toolbar = toolbarRef.current;
+      const toolbarHeight = toolbar ? toolbar.offsetHeight : 0;
+      const stride = getPageStride();
+      return Math.max(0, (pageNum - 1) * stride - toolbarHeight - 10);
+    },
+    [getPageStride],
+  );
+
+  // 본문 스크롤 (DOM 우선, 추정 stride 폴백) — 점프·검색 공용
+  const scrollMainToPage = useCallback(
+    (pageNum, options = {}) => {
+      const container = mainRef.current;
+      if (!container) return false;
+
+      const toolbar = toolbarRef.current;
+      const toolbarHeight = toolbar ? toolbar.offsetHeight : 0;
+      const padding = 10;
+      const lock = options.lock !== false;
+
+      if (lock) {
+        jumpScrollLockRef.current = true;
+        isScrollingRef.current = false;
+        if (scrollSettleTimerRef.current) {
+          clearTimeout(scrollSettleTimerRef.current);
+          scrollSettleTimerRef.current = null;
+        }
+      }
+
+      const releaseScrollLock = () => {
+        if (!lock) return;
+        // 즉시 해제하되, 현재 프레임의 scroll 이벤트가 이미 큐잉된 것을 무시하도록
+        // 1 프레임만 대기 (double-rAF는 저사양 PC에서 고착 위험)
+        requestAnimationFrame(() => {
+          jumpScrollLockRef.current = false;
+        });
+      };
+
+      const el = pageContainerRefs.current[pageNum - 1];
+      if (el) {
+        const containerRect = container.getBoundingClientRect();
+        const elRect = el.getBoundingClientRect();
+        container.scrollTop = Math.max(
+          0,
+          elRect.top - containerRect.top + container.scrollTop - toolbarHeight - padding,
+        );
+        releaseScrollLock();
+        return true;
+      }
+
+      container.scrollTop = computeScrollTopForPage(pageNum);
+      releaseScrollLock();
+      return true;
+    },
+    [computeScrollTopForPage],
+  );
 
   // 가상 마운트 직후 스크롤을 페인트 전에 맞춤 (한 프레임 깜빡임·smooth 스크롤 방지)
   useLayoutEffect(() => {
-    const top = pendingJumpScrollTopRef.current;
-    if (top == null) return;
-    const container = mainRef.current;
-    if (!container) return;
-    pendingJumpScrollTopRef.current = null;
-    container.scrollTop = top;
-  }, [mountRange.lo, mountRange.hi]);
+    const target = pendingJumpPageRef.current;
+    if (target == null) return;
+    pendingJumpPageRef.current = null;
+    scrollMainToPage(target);
+  }, [mountRange.lo, mountRange.hi, scrollMainToPage]);
+  // 스크롤: 렌더 일시 중지 + 마운트 범위는 확장만(축소는 scrollend/타이머에서)
   useEffect(() => {
     const container = mainRef.current;
-    if (!container || !pdf || !totalPages) return;
+    if (!container) return;
 
-    let scheduled = false;
+    let mountScheduled = false;
+
     const onScroll = () => {
       if (jumpScrollLockRef.current) return;
-      if (scheduled) return;
-      scheduled = true;
+
+      if (!isScrollingRef.current) {
+        isScrollingRef.current = true;
+        backgroundRenderPausedRef.current = true;
+      }
+
+      // 항상 타이머 폴백을 설정 (scrollend가 안 오는 환경에서도 안전)
+      if (scrollSettleTimerRef.current) {
+        clearTimeout(scrollSettleTimerRef.current);
+      }
+      scrollSettleTimerRef.current = setTimeout(
+        finishScrolling,
+        SCROLL_SETTLE_MS,
+      );
+
+      if (!pdf || !totalPages) return;
+      if (mountScheduled) return;
+      mountScheduled = true;
       requestAnimationFrame(() => {
-        scheduled = false;
-        const center = pageFromScrollTop(container.scrollTop);
+        mountScheduled = false;
+        if (!pdf || !totalPages) return;
+        const c = mainRef.current;
+        if (!c) return;
+
+        // 스크롤 중: 가벼운 수학으로 현재 페이지 추정 (getBoundingClientRect 회피)
+        // 페이지 번호가 바뀔 때만 state 갱신 (매 프레임 리렌더 없이 경계 넘기 감지)
+        const center = pageFromScrollTop(c.scrollTop);
+        if (center !== currentPageRef.current) {
+          currentPageRef.current = center;
+          setCurrentPage(center);
+        }
+
         const lo = Math.max(1, center - MOUNT_BUFFER);
         const hi = Math.min(totalPages, center + MOUNT_BUFFER);
         const prev = mountRangeRef.current;
-        if (prev.lo === lo && prev.hi === hi) return;
-        mountRangeRef.current = { lo, hi };
-        setMountRange({ lo, hi });
+        const newLo = Math.min(prev.lo, lo);
+        const newHi = Math.max(prev.hi, hi);
+        if (prev.lo === newLo && prev.hi === newHi) return;
+        mountRangeRef.current = { lo: newLo, hi: newHi };
+        setMountRange({ lo: newLo, hi: newHi });
       });
     };
 
+    const onScrollEnd = () => {
+      if (scrollSettleTimerRef.current) {
+        clearTimeout(scrollSettleTimerRef.current);
+        scrollSettleTimerRef.current = null;
+      }
+      finishScrolling();
+    };
+
+    // 안전장치: 어떤 이유로든 lock/scrolling이 고착되면 자동 해제
+    const watchdogInterval = setInterval(() => {
+      if (jumpScrollLockRef.current && !jumpInProgressRef.current) {
+        jumpScrollLockRef.current = false;
+      }
+      if (
+        isScrollingRef.current &&
+        !scrollSettleTimerRef.current &&
+        !jumpInProgressRef.current
+      ) {
+        isScrollingRef.current = false;
+        backgroundRenderPausedRef.current = false;
+      }
+    }, 500);
+
     container.addEventListener("scroll", onScroll, { passive: true });
-    return () => container.removeEventListener("scroll", onScroll);
-  }, [pdf, totalPages, scale, pageFromScrollTop]);
+    if (SUPPORTS_SCROLL_END) {
+      container.addEventListener("scrollend", onScrollEnd, { passive: true });
+    }
+
+    return () => {
+      clearInterval(watchdogInterval);
+      container.removeEventListener("scroll", onScroll);
+      if (SUPPORTS_SCROLL_END) {
+        container.removeEventListener("scrollend", onScrollEnd);
+      }
+      if (scrollSettleTimerRef.current) {
+        clearTimeout(scrollSettleTimerRef.current);
+        scrollSettleTimerRef.current = null;
+      }
+    };
+  }, [pdf, totalPages, pageFromScrollTop, pageFromViewportCenter, finishScrolling]);
 
   // PDF 변경 시 썸네일 큐/상태 초기화 + 영구 캐시 일괄 로드
   useEffect(() => {
@@ -1734,14 +1990,14 @@ export default function PdfViewerWithBookmarks() {
       }
     })();
 
-    // 안전 타임아웃: 본문 렌더가 늦어져도 1.5초 후엔 썸네일 워커 가동 (잠금 방지)
+    // 안전 타임아웃: 본문 렌더가 늦어져도 즉시 썸네일 워커 가동
     const fallbackTimer = setTimeout(() => {
       if (cancelled) return;
       if (!bodyFirstReadyRef.current) {
         bodyFirstReadyRef.current = true;
         startThumbWorker();
       }
-    }, 600);
+    }, 150);
 
     return () => {
       cancelled = true;
@@ -1750,11 +2006,14 @@ export default function PdfViewerWithBookmarks() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdf, totalPages]);
 
-  // PDF 열림 직후: 현재 페이지 preview→full 우선 (첫 화면까지 시간 단축)
+  // PDF 열림 직후: 1페이지만 여기서 렌더 (멀리 점프·북마크는 bootstrapViewerAtPage)
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
+    if (jumpInProgressRef.current) return;
 
     const cp = currentPageRef.current || currentPage || 1;
+    if (cp !== 1) return;
+
     ensureMountRange(cp);
     visiblePagesRef.current = new Set(
       [cp - 1, cp, cp + 1].filter((p) => p >= 1 && p <= totalPages),
@@ -1792,8 +2051,9 @@ export default function PdfViewerWithBookmarks() {
   useEffect(() => {
     if (!pdf || totalPages === 0) return;
     if (jumpInProgressRef.current) return;
+    if (isScrollingRef.current) return;
 
-    const tier = isScrollingRef.current ? "preview" : "full";
+    const tier = "full";
     const { renderTargets, keepTargets } = computeRenderTargets(totalPages);
 
     const toRelease = [];
@@ -1815,7 +2075,7 @@ export default function PdfViewerWithBookmarks() {
         }
         const pageNum = pickNextFromQueue(queue);
         if (!pageNum) break;
-        const activeTier = isScrollingRef.current ? "preview" : "full";
+        const activeTier = "full";
         try {
           const ok = await renderPage(pageNum, scale, { tier: activeTier });
           if (
@@ -2121,6 +2381,14 @@ export default function PdfViewerWithBookmarks() {
         setSearchQuery("");
         setSearchMatches([]);
         setSearchIndex(0);
+
+        resetRenderState();
+
+        if (initialPage !== 1) {
+          queueMicrotask(() => {
+            void bootstrapViewerAtPageRef.current?.(initialPage);
+          });
+        }
       }
 
       // 5) 백그라운드: 첫 페이지 viewport 정밀 계산 + 메타 캐시 갱신
@@ -2525,46 +2793,6 @@ export default function PdfViewerWithBookmarks() {
     };
   }, [loadPdfFromPath]);
 
-  // 🔹 스크롤 중 표시 (passive scroll listener로 부담 최소화)
-  useEffect(() => {
-    const container = mainRef.current;
-    if (!container) return;
-
-    const onScroll = () => {
-      isScrollingRef.current = true;
-      if (scrollSettleTimerRef.current) {
-        clearTimeout(scrollSettleTimerRef.current);
-      }
-      // 스크롤 중에도 저해상도 프리뷰 렌더를 돌리기 위해 (rAF로 스로틀)
-      if (!scrollRenderKickRef.current) {
-        scrollRenderKickRef.current = requestAnimationFrame(() => {
-          scrollRenderKickRef.current = null;
-          setVisiblePagesVersion((v) => v + 1);
-        });
-      }
-      scrollSettleTimerRef.current = setTimeout(() => {
-        isScrollingRef.current = false;
-        void (async () => {
-          await ensureCurrentPageFull();
-          setVisiblePagesVersion((v) => v + 1);
-        })();
-      }, SCROLL_SETTLE_MS);
-    };
-
-    container.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      container.removeEventListener("scroll", onScroll);
-      if (scrollSettleTimerRef.current) {
-        clearTimeout(scrollSettleTimerRef.current);
-        scrollSettleTimerRef.current = null;
-      }
-      if (scrollRenderKickRef.current) {
-        cancelAnimationFrame(scrollRenderKickRef.current);
-        scrollRenderKickRef.current = null;
-      }
-    };
-  }, [ensureCurrentPageFull]);
-
   // 현재 페이지가 바뀌면 해당 페이지 full 렌더 (jumpToPage가 이미 처리 중이면 생략)
   useEffect(() => {
     if (!pdf || !currentPage || isScrollingRef.current) return;
@@ -2672,29 +2900,8 @@ export default function PdfViewerWithBookmarks() {
       });
     };
 
-    // 현재 페이지 추적도 별도 rAF로 코얼레싱 (스크롤마다 setState 폭주 방지)
-    let pageScheduled = false;
-    let pendingBestPage = null;
-    const scheduleCurrentPageUpdate = () => {
-      if (pageScheduled) return;
-      pageScheduled = true;
-      requestAnimationFrame(() => {
-        pageScheduled = false;
-        if (
-          pendingBestPage != null &&
-          pendingBestPage !== currentPageRef.current
-        ) {
-          setCurrentPage(pendingBestPage);
-        }
-        pendingBestPage = null;
-      });
-    };
-
     const observer = new IntersectionObserver(
       (entries) => {
-        const container = mainRef.current;
-        if (!container) return;
-
         let visibleChanged = false;
         entries.forEach((entry) => {
           const pageNum = Number(entry.target.dataset.page);
@@ -2711,32 +2918,8 @@ export default function PdfViewerWithBookmarks() {
             }
           }
         });
-        if (visibleChanged) scheduleVisibleUpdate();
-
-        const bottomGap =
-          container.scrollHeight - container.scrollTop - container.clientHeight;
-
-        if (bottomGap <= 8) {
-          pendingBestPage = totalPages;
-          scheduleCurrentPageUpdate();
-          return;
-        }
-
-        let bestPage = currentPageRef.current;
-        let bestRatio = 0;
-        entries.forEach((entry) => {
-          const pageNum = Number(entry.target.dataset.page);
-          if (!pageNum) return;
-          const ratio = entry.intersectionRatio;
-          if (ratio > bestRatio) {
-            bestRatio = ratio;
-            bestPage = pageNum;
-          }
-        });
-
-        if (bestRatio > 0) {
-          pendingBestPage = bestPage;
-          scheduleCurrentPageUpdate();
+        if (visibleChanged && !isScrollingRef.current) {
+          scheduleVisibleUpdate();
         }
       },
       {
@@ -2783,14 +2966,67 @@ export default function PdfViewerWithBookmarks() {
     [fileName, filePath],
   );
 
-  const computeScrollTopForPage = useCallback(
-    (pageNum) => {
-      const toolbar = toolbarRef.current;
-      const toolbarHeight = toolbar ? toolbar.offsetHeight : 0;
-      const stride = getPageStride();
-      return Math.max(0, (pageNum - 1) * stride - toolbarHeight - 10);
+  const waitForTextLayerReady = useCallback(async (pageNum, maxMs = 4000) => {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+      const layer = textLayerRefs.current[pageNum - 1];
+      if (layer?.querySelector("[data-span-index]")) return true;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    return false;
+  }, []);
+
+  const waitForJumpComplete = useCallback(async (maxMs = 10000) => {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+      if (!jumpInProgressRef.current) return true;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    return false;
+  }, []);
+
+  const scrollToSearchMatchOnPage = useCallback(
+    (pageNum, query, matchStart = null) => {
+      const q = (query ?? "").trim();
+      if (!q) return;
+      applySearchHighlightForPage(pageNum, q);
+      const container = mainRef.current;
+      const layer = textLayerRefs.current[pageNum - 1];
+      if (!container || !layer) return;
+
+      let hit = null;
+      if (matchStart != null) {
+        hit = layer.querySelector(
+          `[data-search-hit][data-search-start="${matchStart}"]`,
+        );
+      }
+      if (!hit) hit = layer.querySelector("[data-search-hit]");
+      if (!hit) {
+        scrollMainToPage(pageNum);
+        endProgrammaticNavigation();
+        return;
+      }
+
+      const containerRect = container.getBoundingClientRect();
+      const hitRect = hit.getBoundingClientRect();
+      const hitCenterY = hitRect.top + hitRect.height / 2;
+      const viewCenterY = containerRect.top + container.clientHeight / 2;
+      const delta = hitCenterY - viewCenterY;
+
+      jumpScrollLockRef.current = true;
+      isScrollingRef.current = false;
+      container.scrollTop = Math.max(0, container.scrollTop + delta);
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          endProgrammaticNavigation();
+        });
+      });
     },
-    [getPageStride],
+    [
+      applySearchHighlightForPage,
+      scrollMainToPage,
+      endProgrammaticNavigation,
+    ],
   );
 
   // 스크롤로 페이지 이동 (O(1)). instant=true면 scrollTop 직접 대입(애니메이션 없음)
@@ -2818,100 +3054,184 @@ export default function PdfViewerWithBookmarks() {
       ? (basePageWidthRef.current * scale) / baseScaleRef.current
       : null;
 
-  // 🔹 페이지 점프: 가상 마운트 → 동기 스크롤 → placeholder → 저해상도 → 선명(full)
-  const jumpToPage = useCallback(
-    (pageNum) => {
-      if (!totalPages || !pdf) return;
-      const target =
-        pageNum < 1 ? 1 : pageNum > totalPages ? totalPages : pageNum;
+  // 북마크·멀리 점프: 보고 있는 페이지를 최우선 렌더 (회색 화면 최소화)
+  const bootstrapViewerAtPage = useCallback(
+    async (target) => {
+      const doc = activePdfRef.current;
+      const pages = totalPages;
+      if (!doc || !pages) return;
+      const pageNum = Math.min(pages, Math.max(1, target));
 
-      const cp = currentPageRef.current || 1;
-      const isFar = Math.abs(target - cp) > KEEP_RENDERED_RANGE;
-
-      jumpInProgressRef.current = true;
-      jumpScrollLockRef.current = true;
-      isScrollingRef.current = false;
       if (scrollSettleTimerRef.current) {
         clearTimeout(scrollSettleTimerRef.current);
         scrollSettleTimerRef.current = null;
       }
 
-      const keepRendering = new Set([target, target - 1, target + 1]);
-      cancelRenderTasksExcept(keepRendering);
+      jumpInProgressRef.current = true;
+      jumpScrollLockRef.current = true;
+      isScrollingRef.current = false;
+      cancelAllPageRenderTasks();
 
-      if (isFar) {
+      const cp = currentPageRef.current || 1;
+      if (Math.abs(pageNum - cp) > KEEP_RENDERED_RANGE) {
         const toRelease = [];
         renderedPagesRef.current.forEach((p) => {
-          if (Math.abs(p - target) > KEEP_RENDERED_RANGE) toRelease.push(p);
+          if (Math.abs(p - pageNum) > KEEP_RENDERED_RANGE) toRelease.push(p);
         });
         toRelease.forEach((p) => releasePageMemory(p));
       }
 
-      currentPageRef.current = target;
-      const near = [];
-      for (let k = -WINDOW_SIZE; k <= WINDOW_SIZE; k++) {
-        const p = target + k;
-        if (p >= 1 && p <= totalPages) near.push(p);
-      }
-      visiblePagesRef.current = new Set(near);
+      currentPageRef.current = pageNum;
+      visiblePagesRef.current = new Set(
+        [pageNum - 1, pageNum, pageNum + 1].filter(
+          (p) => p >= 1 && p <= pages,
+        ),
+      );
 
-      const scrollTop = computeScrollTopForPage(target);
-      pendingJumpScrollTopRef.current = scrollTop;
-      const { changed: mountChanged } = ensureMountRange(target);
-      if (!mountChanged) {
-        pendingJumpScrollTopRef.current = null;
-        const container = mainRef.current;
-        if (container) container.scrollTop = scrollTop;
-      }
-      setCurrentPage(target);
+      flushMountRangeForPage(pageNum);
+      currentPageRef.current = pageNum;
+      scrollMainToPage(pageNum);
 
-      if (!thumbDoneRef.current.has(target)) requestThumbnail(target);
+      if (!thumbDoneRef.current.has(pageNum)) requestThumbnail(pageNum);
 
-      backgroundRenderPausedRef.current = true;
-      (async () => {
-        const generationAtStart = renderGenerationRef.current;
-        const neighbors = [target - 1, target + 1].filter(
-          (p) => p >= 1 && p <= totalPages,
-        );
+      const gen = renderGenerationRef.current;
+      const scaleNow = scaleRef.current ?? scale;
 
-        try {
-          if (generationAtStart !== renderGenerationRef.current) return;
-
-          await paintJumpPlaceholder(target, scale);
-          for (const p of neighbors) drawPreviewFromThumb(p);
-
-          if (pageQualityRef.current.get(target) !== "full") {
-            await renderPage(target, scale, { tier: "preview", jump: true });
-          }
-          if (generationAtStart !== renderGenerationRef.current) return;
-
-          if (!bodyFirstReadyRef.current) {
-            bodyFirstReadyRef.current = true;
-            startThumbWorker();
-          }
-        } catch (err) {
-          console.error("priority render 실패:", err);
-        } finally {
-          backgroundRenderPausedRef.current = false;
-          jumpInProgressRef.current = false;
-          jumpScrollLockRef.current = false;
+      try {
+        tryFastJumpFill(pageNum, scaleNow);
+        let hasCanvas = await waitForPageCanvas(pageNum);
+        if (!hasCanvas) {
+          flushMountRangeForPage(pageNum);
+          scrollMainToPage(pageNum);
+          hasCanvas = await waitForPageCanvas(pageNum, 800);
         }
 
-        void renderPage(target, scale, { tier: "full" });
-        void Promise.allSettled(
-          neighbors.map((p) => renderPage(p, scale, { tier: "preview" })),
-        ).then(() => {
-          setVisiblePagesVersion((v) => v + 1);
+        const q = pageQualityRef.current.get(pageNum);
+        let previewPromise = null;
+        if (q !== "preview" && q !== "full") {
+          previewPromise = renderPage(pageNum, scaleNow, {
+            tier: "preview",
+            jump: true,
+          });
+        }
+
+        void fillJumpPlaceholderBackground(pageNum, scaleNow);
+
+        const docKey = docKeyRef.current;
+        if (docKey && !renderedPagesRef.current.has(pageNum)) {
+          try {
+            const outputScale = getOutputScale();
+            const [cachedThumb, cachedRender] = await Promise.all([
+              pdfCache.getThumb(docKey, pageNum),
+              pdfCache.getRender(
+                makeRenderKey(docKey, pageNum, scaleNow, outputScale),
+              ),
+            ]);
+            if (
+              !renderedPagesRef.current.has(pageNum) &&
+              cachedThumb &&
+              drawImageOnPageCanvas(pageNum, cachedThumb, scaleNow)
+            ) {
+              if (previewPromise) {
+                const prevTask = pageRenderTasksRef.current.get(pageNum);
+                try {
+                  prevTask?.cancel();
+                } catch (_) {
+                  /* ignore */
+                }
+                pageRenderTasksRef.current.delete(pageNum);
+                previewPromise = null;
+              }
+            } else if (
+              !renderedPagesRef.current.has(pageNum) &&
+              cachedRender &&
+              (await applyCachedRenderToPage(
+                pageNum,
+                cachedRender,
+                scaleNow,
+                gen,
+              ))
+            ) {
+              if (previewPromise) {
+                const prevTask = pageRenderTasksRef.current.get(pageNum);
+                try {
+                  prevTask?.cancel();
+                } catch (_) {
+                  /* ignore */
+                }
+                pageRenderTasksRef.current.delete(pageNum);
+                previewPromise = null;
+              }
+            }
+          } catch (_) {
+            /* ignore */
+          }
+        }
+
+        if (previewPromise) {
+          await previewPromise;
+        }
+
+        if (gen === renderGenerationRef.current) {
+          bodyFirstReadyRef.current = true;
+          startThumbWorker();
+          scrollMainToPage(pageNum);
+        }
+      } catch (err) {
+        console.error("bootstrapViewerAtPage 실패:", err);
+      } finally {
+        jumpInProgressRef.current = false;
+        endProgrammaticNavigation();
+        if (gen === renderGenerationRef.current) {
+          void renderPage(pageNum, scaleNow, { tier: "full" });
+        }
+      }
+    },
+    [
+      totalPages,
+      scale,
+      scrollMainToPage,
+      waitForPageCanvas,
+      requestThumbnail,
+      flushMountRangeForPage,
+      endProgrammaticNavigation,
+    ],
+  );
+
+  useEffect(() => {
+    bootstrapViewerAtPageRef.current = bootstrapViewerAtPage;
+  }, [bootstrapViewerAtPage]);
+
+  // 🔹 페이지 점프: 가상 마운트 → 동기 스크롤 → 목표 페이지 우선 렌더
+  const jumpToPage = useCallback(
+    (pageNum) => {
+      if (!totalPages || !pdf) return;
+      void bootstrapViewerAtPage(pageNum);
+    },
+    [pdf, totalPages, bootstrapViewerAtPage],
+  );
+
+  const navigateToSearchMatch = useCallback(
+    async (match, query) => {
+      if (!match || !pdf) return;
+      const q = (query ?? "").trim();
+      if (!q) return;
+
+      jumpToPage(match.page);
+      await waitForTextLayerReady(match.page);
+      await waitForJumpComplete();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          scrollToSearchMatchOnPage(match.page, q, match.start);
         });
-      })();
+      });
     },
     [
       pdf,
-      totalPages,
-      scale,
-      requestThumbnail,
-      ensureMountRange,
-      computeScrollTopForPage,
+      jumpToPage,
+      waitForTextLayerReady,
+      waitForJumpComplete,
+      scrollToSearchMatchOnPage,
     ],
   );
 
@@ -2921,10 +3241,8 @@ export default function PdfViewerWithBookmarks() {
       bm.filePath ? t.filePath === bm.filePath : t.fileName === bm.fileName,
     );
     if (targetTab) {
-      handleSelectTab(targetTab.id);
-      setTimeout(() => {
-        jumpToPage(bm.page);
-      }, 200);
+      await handleSelectTab(targetTab.id);
+      void bootstrapViewerAtPage(bm.page);
     } else {
       const cacheKey = bm.filePath || bm.fileName;
       const cachedDoc = pdfCacheRef.current[cacheKey];
@@ -2966,16 +3284,16 @@ export default function PdfViewerWithBookmarks() {
         setSearchIndex(0);
 
         resetRenderState();
-
-        setTimeout(() => {
-          jumpToPage(bm.page);
-        }, 200);
+        docKeyRef.current =
+          bm.filePath || bm.fileName
+            ? makeDocKey({ filePath: bm.filePath, fileName: bm.fileName })
+            : null;
+        queueMicrotask(() => {
+          void bootstrapViewerAtPage(bm.page);
+        });
       } else if (bm.filePath && ipcRenderer) {
         try {
           await loadPdfFromPath(bm.filePath, bm.page);
-          setTimeout(() => {
-            jumpToPage(bm.page);
-          }, 200);
         } catch (e) {
           alert(
             `PDF 파일을 다시 여는 데 실패했습니다.\n경로: ${bm.filePath}\n파일이 옮겨졌는지 / 삭제되지 않았는지 확인해주세요.`,
@@ -2987,7 +3305,7 @@ export default function PdfViewerWithBookmarks() {
         );
       }
     }
-  }, [tabs, handleSelectTab, jumpToPage, loadPdfFromPath]);
+  }, [tabs, handleSelectTab, bootstrapViewerAtPage, loadPdfFromPath]);
 
   // 줌
   const handleZoomIn = useCallback(() => {
@@ -3264,7 +3582,9 @@ export default function PdfViewerWithBookmarks() {
 
       setSearchMatches(matches);
       setSearchIndex(0);
-      if (matches.length > 0) jumpToPage(matches[0].page);
+      if (matches.length > 0) {
+        void navigateToSearchMatch(matches[0], q);
+      }
     } finally {
       isSearchingRef.current = false;
     }
@@ -3273,7 +3593,7 @@ export default function PdfViewerWithBookmarks() {
     totalPages,
     ensureAllPageTexts,
     applySearchHighlightForPage,
-    jumpToPage,
+    navigateToSearchMatch,
   ]);
 
   // 검색어 변경 시: DOM 원복 + 보이는 페이지에 즉시 하이라이트 반영
@@ -3314,9 +3634,10 @@ export default function PdfViewerWithBookmarks() {
       const len = searchMatches.length;
       const idx = ((nextIndex % len) + len) % len;
       setSearchIndex(idx);
-      jumpToPage(searchMatches[idx].page);
+      const match = searchMatches[idx];
+      void navigateToSearchMatch(match, searchQuery.trim());
     },
-    [searchMatches, jumpToPage],
+    [searchMatches, searchQuery, navigateToSearchMatch],
   );
 
   const hasSearchResults = searchMatches.length > 0;
