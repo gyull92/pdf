@@ -1,6 +1,6 @@
 {
   "name": "gyul-pdf-viewer",
-  "version": "1.4.3",
+  "version": "1.4.5",
   "description": "즐겨찾기 기능이 포함된 윈도우용 PDF 뷰어",
   "type": "module",
   "main": "electron/main.cjs",
@@ -38,7 +38,8 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "artifactName": "${name}-setup-${version}.${ext}"
     },
     "mac": {
       "target": "dmg",
