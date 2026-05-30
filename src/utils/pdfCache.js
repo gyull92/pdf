@@ -9,7 +9,7 @@ const STORE_RENDERS = "renders";
 const STORE_DOC_META = "docMeta";
 const STORE_THUMBS = "thumbs";
 // 썸네일 해상도 변경 시 키 버전을 올려 기존 저해상도 캐시 무효화
-const THUMB_CACHE_KEY_VERSION = 2;
+const THUMB_CACHE_KEY_VERSION = 3;
 
 // 16GB RAM 환경: 디스크 캐시도 과도하면 getRender/getThumbs 시 RAM 급증
 export const MAX_RENDER_CACHE_BYTES = 400 * 1024 * 1024;
@@ -381,6 +381,23 @@ export const pdfCache = {
       /* ignore */
     }
     return result;
+  },
+
+  async deleteThumb(docKey, pageNum) {
+    try {
+      const key = this.thumbCacheKey(docKey, pageNum);
+      const { store, complete } = await tx(STORE_THUMBS, "readwrite");
+      const existing = await reqAsPromise(store.get(key));
+      await reqAsPromise(store.delete(key));
+      await complete;
+      if (existing?.size && approxThumbBytes >= 0) {
+        approxThumbBytes = Math.max(0, approxThumbBytes - existing.size);
+      } else {
+        approxThumbBytes = -1;
+      }
+    } catch (_) {
+      /* ignore */
+    }
   },
 
   async setThumb(docKey, pageNum, dataUrl) {

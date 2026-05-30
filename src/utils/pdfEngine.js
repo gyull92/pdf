@@ -107,10 +107,11 @@ class PdfPageAdapter {
   // intent: 'preview' — 스크롤/점프 시 저해상도 빠른 렌더, 'display' — 최종 화질
   render({ canvasContext, viewport, transform: matrixTransformArr, intent }) {
     const flag = { cancelled: false };
+    const isThumbnail = intent === "thumbnail";
     const isJump = intent === "jump";
     const isPreview = intent === "preview" || isJump;
-    const scaleFactor = isJump ? 0.28 : isPreview ? 0.42 : 1;
-    const jpegQuality = isJump ? 62 : isPreview ? 72 : 85;
+    const scaleFactor = isThumbnail ? 1 : isJump ? 0.28 : isPreview ? 0.42 : 1;
+    const jpegQuality = isThumbnail ? 82 : isJump ? 62 : isPreview ? 72 : 85;
 
     const outputScale =
       Array.isArray(matrixTransformArr) && matrixTransformArr[0]
@@ -210,6 +211,8 @@ class PdfPageAdapter {
       }
 
       try {
+        canvasContext.fillStyle = "#ffffff";
+        canvasContext.fillRect(0, 0, targetWidthPx, targetHeightPx);
         canvasContext.drawImage(bitmap, 0, 0, targetWidthPx, targetHeightPx);
       } finally {
         try {
@@ -296,7 +299,7 @@ class PdfDocumentAdapter {
 
   getPage(num) {
     if (this._destroyed) {
-      return Promise.reject(new Error("Document is destroyed"));
+      return Promise.reject(new RenderingCancelledException());
     }
     const idx = num - 1;
     if (this._pageCache.has(idx)) {
@@ -407,6 +410,7 @@ export function isRenderCancelledError(err) {
   if (err instanceof RenderingCancelledException) return true;
   return (
     err.name === "RenderingCancelledException" ||
-    /cancel/i.test(err.message || "")
+    /cancel/i.test(err.message || "") ||
+    err.message === "Document is destroyed"
   );
 }

@@ -5,6 +5,8 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const { autoUpdater } = require("electron-updater");
+const pkg = require("../package.json");
+const APP_WINDOW_TITLE = `${pkg.name} v${pkg.version}`;
 
 // 🔹 PDFium 렌더 결과를 임시 파일로 받기 위한 디렉터리
 //    pdfium-native가 JS에 직접 반환하는 Buffer는 external buffer라서
@@ -184,12 +186,13 @@ function extractPdfFromArgv(argv) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
+    title: APP_WINDOW_TITLE,
     width: 1200,
     height: 800,
     icon:
       process.platform === "darwin"
-        ? path.join(__dirname, "..", "assets", "mandarinPDF3.icns") // 🧡 mac용 아이콘 (있으면)
-        : path.join(__dirname, "..", "assets", "mandarinPDF3.ico"), // 🧡 win용 아이콘
+        ? path.join(__dirname, "..", "src", "assets", "mandarinPDF3.icns")
+        : path.join(__dirname, "..", "src", "assets", "mandarinPDF3.ico"),
     autoHideMenuBar: true, // 창 메뉴바 자동 숨김
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -564,23 +567,42 @@ if (!gotLock) {
   // ============================================================
   // 🔹 자동 업데이트 (electron-updater)
   // ============================================================
+  function sendUpdateStatus(payload) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("app-update:status", payload);
+    }
+  }
+
+  function clearUpdateUi() {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setProgressBar(-1);
+    }
+    sendUpdateStatus({ phase: "idle" });
+  }
+
   function initAutoUpdater() {
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = false;
+    let pendingVersion = null;
 
     autoUpdater.on("update-available", (info) => {
-      const version = info.version || "새 버전";
+      pendingVersion = info.version || null;
       dialog
         .showMessageBox(mainWindow, {
           type: "info",
           title: "업데이트 알림",
-          message: `새 버전(v${version})이 있습니다.\n지금 업데이트할까요?`,
+          message: `새 버전(v${pendingVersion || "새 버전"})이 있습니다.\n지금 업데이트할까요?`,
           buttons: ["업데이트", "나중에"],
           defaultId: 0,
           cancelId: 1,
         })
         .then(({ response }) => {
           if (response === 0) {
+            sendUpdateStatus({
+              phase: "downloading",
+              percent: 0,
+              version: pendingVersion,
+            });
             autoUpdater.downloadUpdate();
           }
         });
@@ -594,15 +616,18 @@ if (!gotLock) {
       const percent = Math.round(progress.percent);
       if (mainWindow) {
         mainWindow.setProgressBar(percent / 100);
-        mainWindow.setTitle(`업데이트 다운로드 중... ${percent}%`);
       }
+      sendUpdateStatus({
+        phase: "downloading",
+        percent,
+        version: pendingVersion,
+        transferred: progress.transferred,
+        total: progress.total,
+      });
     });
 
     autoUpdater.on("update-downloaded", () => {
-      if (mainWindow) {
-        mainWindow.setProgressBar(-1);
-        mainWindow.setTitle("귤PDF뷰어");
-      }
+      clearUpdateUi();
       dialog
         .showMessageBox(mainWindow, {
           type: "info",
@@ -621,10 +646,7 @@ if (!gotLock) {
     });
 
     autoUpdater.on("error", (err) => {
-      if (mainWindow) {
-        mainWindow.setProgressBar(-1);
-        mainWindow.setTitle("귤PDF뷰어");
-      }
+      clearUpdateUi();
       console.error("자동 업데이트 오류:", err?.message || err);
     });
 

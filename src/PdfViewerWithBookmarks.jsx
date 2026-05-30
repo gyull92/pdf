@@ -17,7 +17,13 @@ import {
 import PageSidebar from "./components/SidePage";
 import BookmarkSidebar from "./components/BookMarkPage";
 import PdfToolbar from "./components/ToolBar";
+import UpdateProgressOverlay from "./components/UpdateProgressOverlay";
 import { pdfCache, makeDocKey, makeRenderKey } from "./utils/pdfCache";
+import {
+  fillCanvasWhite,
+  isCanvasMostlyBlank,
+  validateThumbDataUrl,
+} from "./utils/thumbUtils";
 import colorPenCursor from "./png/colorPen.png"; // 글자 형광펜
 import freeAreaCursor from "./png/freeArea.png"; // 자유영역 형광펜
 import eraserCursor from "./png/eraser.png"; // 지우개
@@ -395,6 +401,7 @@ export default function PdfViewerWithBookmarks() {
   const [showOnlyBookmarked, setShowOnlyBookmarked] = useState(false);
 
   const [isDragOver, setIsDragOver] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState(null);
 
   const canvasRefs = useRef([]);
   const textLayerRefs = useRef([]);
@@ -488,6 +495,22 @@ export default function PdfViewerWithBookmarks() {
         }
       });
       pdfCacheRef.current = {};
+    };
+  }, []);
+
+  // 🔹 자동 업데이트 진행률 (본문 오버레이)
+  useEffect(() => {
+    if (!ipcRenderer) return;
+    const onStatus = (_event, payload) => {
+      if (!payload || payload.phase === "idle") {
+        setUpdateStatus(null);
+        return;
+      }
+      setUpdateStatus(payload);
+    };
+    ipcRenderer.on("app-update:status", onStatus);
+    return () => {
+      ipcRenderer.removeListener("app-update:status", onStatus);
     };
   }, []);
 
@@ -1123,10 +1146,14 @@ export default function PdfViewerWithBookmarks() {
         cssWidth,
         cssHeight,
       );
-    } else if (pdf) {
+    } else if (activePdfRef.current) {
+      const doc = activePdfRef.current;
       try {
-        const page = await pdf.getPage(num);
-        if (generation === renderGenerationRef.current) {
+        const page = await doc.getPage(num);
+        if (
+          generation === renderGenerationRef.current &&
+          activePdfRef.current === doc
+        ) {
           const viewport = page.getViewport({
             scale: scaleValue,
             rotation: page.rotate,
@@ -1279,7 +1306,6 @@ export default function PdfViewerWithBookmarks() {
         prev && prev.length === length
           ? [...prev]
           : new Array(length).fill(null);
-      if (next[num - 1]) return next;
       next[num - 1] = dataUrl;
       return next;
     });
@@ -1289,6 +1315,23 @@ export default function PdfViewerWithBookmarks() {
     }
   };
 
+  const clearThumbnail = useCallback((pageNum) => {
+    if (!pageNum || pageNum < 1) return;
+    thumbDoneRef.current.delete(pageNum);
+    thumbInProgressRef.current.delete(pageNum);
+    setThumbnails((prev) => {
+      if (!prev?.length) return prev;
+      if (!prev[pageNum - 1]) return prev;
+      const next = [...prev];
+      next[pageNum - 1] = null;
+      return next;
+    });
+    const docKey = docKeyRef.current;
+    if (docKey) {
+      pdfCache.deleteThumb(docKey, pageNum).catch(() => {});
+    }
+  }, []);
+
   const hydrateThumbFromCache = useCallback(async (pageNum) => {
     const docKey = docKeyRef.current;
     if (!docKey || pageNum < 1) return false;
@@ -1296,8 +1339,12 @@ export default function PdfViewerWithBookmarks() {
     try {
       const url = await pdfCache.getThumb(docKey, pageNum);
       if (url) {
-        writeThumbnail(pageNum, url);
-        return true;
+        const ok = await validateThumbDataUrl(url);
+        if (ok) {
+          writeThumbnail(pageNum, url);
+          return true;
+        }
+        await pdfCache.deleteThumb(docKey, pageNum);
       }
     } catch (_) {
       /* ignore */
@@ -1306,9 +1353,9 @@ export default function PdfViewerWithBookmarks() {
   }, []);
 
   const updateThumbnailFromCanvas = (num, canvas) => {
-    if (thumbDoneRef.current.has(num)) return;
     try {
       if (!canvas.width || !canvas.height) return;
+      if (isCanvasMostlyBlank(canvas)) return;
       const ratio = canvas.height / canvas.width || 1;
       const thumbW = getThumbPixelWidth();
       const thumbCanvas = document.createElement("canvas");
@@ -1316,6 +1363,7 @@ export default function PdfViewerWithBookmarks() {
       thumbCanvas.height = Math.max(1, Math.round(thumbW * ratio));
       const tctx = thumbCanvas.getContext("2d");
       if (!tctx) return;
+      fillCanvasWhite(tctx, thumbCanvas.width, thumbCanvas.height);
       tctx.drawImage(
         canvas,
         0,
@@ -1327,6 +1375,7 @@ export default function PdfViewerWithBookmarks() {
         thumbCanvas.width,
         thumbCanvas.height,
       );
+      if (isCanvasMostlyBlank(thumbCanvas)) return;
       const dataUrl = thumbCanvas.toDataURL("image/jpeg", THUMB_JPEG_QUALITY);
       writeThumbnail(num, dataUrl);
     } catch (e) {
@@ -1336,11 +1385,12 @@ export default function PdfViewerWithBookmarks() {
 
   // 🔹 저배율 전용 썸네일 렌더링 (본문과 독립적, 매우 빠름)
   const renderThumbnailForPage = async (num) => {
-    if (!pdf) return null;
+    const doc = activePdfRef.current;
+    if (!doc) return null;
     if (thumbDoneRef.current.has(num)) return null;
     try {
       const thumbW = getThumbPixelWidth();
-      const page = await pdf.getPage(num);
+      const page = await doc.getPage(num);
       const baseViewport = page.getViewport({
         scale: 1.0,
         rotation: page.rotate,
@@ -1357,10 +1407,18 @@ export default function PdfViewerWithBookmarks() {
       const ctx = thumbCanvas.getContext("2d");
       if (!ctx) return null;
 
-      await page.render({ canvasContext: ctx, viewport }).promise;
+      fillCanvasWhite(ctx, thumbCanvas.width, thumbCanvas.height);
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport,
+        intent: "thumbnail",
+      });
+      await renderTask.promise;
+      if (activePdfRef.current !== doc) return null;
+      if (isCanvasMostlyBlank(thumbCanvas)) return null;
       return thumbCanvas.toDataURL("image/jpeg", THUMB_JPEG_QUALITY);
     } catch (e) {
-      // 페이지 객체 무효 등은 무시
+      if (isRenderCancelledError(e)) return null;
       return null;
     }
   };
@@ -1442,11 +1500,9 @@ export default function PdfViewerWithBookmarks() {
         }
         if (dataUrl) {
           writeThumbnail(next, dataUrl);
-        } else {
-          thumbDoneRef.current.add(next);
         }
       } catch (_) {
-        thumbDoneRef.current.add(next);
+        /* 재시도 가능하도록 thumbDone에 넣지 않음 */
       } finally {
         thumbInProgressRef.current.delete(next);
       }
@@ -1469,7 +1525,8 @@ export default function PdfViewerWithBookmarks() {
   const prerenderDoneRef = useRef(new Set());
 
   const renderPageToCache = async (num) => {
-    if (!pdf) return false;
+    const doc = activePdfRef.current;
+    if (!doc) return false;
     const docKey = docKeyRef.current;
     if (!docKey) return false;
 
@@ -1487,10 +1544,12 @@ export default function PdfViewerWithBookmarks() {
 
     let page;
     try {
-      page = await pdf.getPage(num);
-    } catch (_) {
+      page = await doc.getPage(num);
+    } catch (err) {
+      if (isRenderCancelledError(err)) return false;
       return false;
     }
+    if (activePdfRef.current !== doc) return false;
 
     const viewport = page.getViewport({
       scale: scaleValue,
@@ -1564,13 +1623,14 @@ export default function PdfViewerWithBookmarks() {
 
   // SidePage에서 호출하는 우선 요청 핸들러
   const requestThumbnail = useCallback(
-    (pageNum) => {
+    (pageNum, force = false) => {
       if (!pdf || !pageNum) return;
       if (pageNum < 1 || pageNum > totalPages) return;
-      if (thumbnailsRef.current?.[pageNum - 1]) return;
+      if (!force && thumbnailsRef.current?.[pageNum - 1]) return;
+      if (force) clearThumbnail(pageNum);
       void hydrateThumbFromCache(pageNum).then((hit) => {
         if (hit) return;
-        if (thumbDoneRef.current.has(pageNum)) return;
+        if (!force && thumbDoneRef.current.has(pageNum)) return;
         const queue = thumbRequestQueueRef.current;
         const idx = queue.indexOf(pageNum);
         if (idx !== -1) queue.splice(idx, 1);
@@ -1578,7 +1638,7 @@ export default function PdfViewerWithBookmarks() {
         startThumbWorker();
       });
     },
-    [pdf, totalPages, hydrateThumbFromCache],
+    [pdf, totalPages, hydrateThumbFromCache, clearThumbnail],
   );
 
   // 한 페이지 렌더 (캐시 hit이면 PDF.js 호출 우회)
@@ -1643,11 +1703,23 @@ export default function PdfViewerWithBookmarks() {
       }
     }
 
-    // 2) 일반 렌더 - PDF.js로 그리기
-    if (!pdf) return false;
+    // 2) 일반 렌더 — 항상 활성 문서 ref 사용 (탭 전환·재로드 후 stale pdf 방지)
+    const doc = activePdfRef.current;
+    if (!doc) return false;
 
-    const page = await pdf.getPage(num);
-    if (generation !== renderGenerationRef.current) return false;
+    let page;
+    try {
+      page = await doc.getPage(num);
+    } catch (err) {
+      if (isRenderCancelledError(err)) return false;
+      throw err;
+    }
+    if (
+      generation !== renderGenerationRef.current ||
+      activePdfRef.current !== doc
+    ) {
+      return false;
+    }
 
     const viewport = page.getViewport({
       scale: scaleValue,
@@ -1971,12 +2043,21 @@ export default function PdfViewerWithBookmarks() {
         const hi = Math.min(totalPages, cp + THUMB_RAM_RADIUS);
         const cached = await pdfCache.getThumbsInRange(docKey, lo, hi);
         if (cancelled) return;
+        const validated = new Map();
+        await Promise.all(
+          [...cached.entries()].map(async ([pageNum, url]) => {
+            const ok = await validateThumbDataUrl(url);
+            if (ok) validated.set(pageNum, url);
+            else await pdfCache.deleteThumb(docKey, pageNum);
+          }),
+        );
+        if (cancelled) return;
         setThumbnails((prev) => {
           const next =
             prev?.length === totalPages
               ? [...prev]
               : new Array(totalPages).fill(null);
-          cached.forEach((url, pageNum) => {
+          validated.forEach((url, pageNum) => {
             if (!next[pageNum - 1]) {
               next[pageNum - 1] = url;
               thumbDoneRef.current.add(pageNum);
@@ -2089,7 +2170,7 @@ export default function PdfViewerWithBookmarks() {
             }
           }
         } catch (e) {
-          console.error(e);
+          if (!isRenderCancelledError(e)) console.error(e);
         }
       }
     };
@@ -3178,7 +3259,9 @@ export default function PdfViewerWithBookmarks() {
           scrollMainToPage(pageNum);
         }
       } catch (err) {
-        console.error("bootstrapViewerAtPage 실패:", err);
+        if (!isRenderCancelledError(err)) {
+          console.error("bootstrapViewerAtPage 실패:", err);
+        }
       } finally {
         jumpInProgressRef.current = false;
         endProgrammaticNavigation();
@@ -3814,6 +3897,8 @@ export default function PdfViewerWithBookmarks() {
             onZoomOut={handleZoomOut}
             onResetZoom={handleResetZoom}
           />
+
+          <UpdateProgressOverlay status={updateStatus} />
 
           <PagesWrapper>
             {pdf &&

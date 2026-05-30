@@ -1,10 +1,16 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
+import pkg from './package.json' with { type: 'json' };
+
+const appWindowTitle = `${pkg.name} v${pkg.version}`;
 
 export default defineConfig({
   plugins: [react()],
   base: './',
+  define: {
+    __APP_WINDOW_TITLE__: JSON.stringify(appWindowTitle),
+  },
   resolve: {
     alias: {
       '@': path.resolve('./src')

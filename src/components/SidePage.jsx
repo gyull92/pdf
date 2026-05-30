@@ -370,7 +370,11 @@ function PageSidebar({
               </ThumbnailIconButton>
 
               {src && isVisible ? (
-                <img src={src} alt={`Page ${pageNum}`} />
+                <img
+                  src={src}
+                  alt={`Page ${pageNum}`}
+                  onError={() => onRequestThumbnail?.(pageNum, true)}
+                />
               ) : (
                 <div
                   style={{
